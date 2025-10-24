@@ -1,3 +1,3 @@
+mexc-api
 requests
-python-mexc-api
 flask
