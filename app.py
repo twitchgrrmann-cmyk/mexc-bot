@@ -7,70 +7,110 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Load your API keys from environment variables (set in Render dashboard)
+# === Load environment variables from Render ===
 API_KEY = os.environ.get("MEXC_API_KEY")
 SECRET_KEY = os.environ.get("MEXC_SECRET_KEY")
 
 # === SETTINGS ===
-BASE_URL = "https://api.mexc.com"  # Spot API endpoint
-SYMBOL = "LTCUSDT"
-TRADE_AMOUNT = 10  # USD value per trade
-DEBUG_MODE = True  # Set False when live
+BASE_URL = "https://contract.mexc.com"  # Futures endpoint
+SYMBOL = "LTC_USDT"
+TRADE_SIZE_USDT = 10  # Amount per trade (in USDT)
+LEVERAGE = 200        # Your chosen leverage
+DEBUG_MODE = True     # Set to False for live use
 
-# === HELPER: SIGN REQUEST ===
+
+# === AUTH + SIGNING ===
 def sign_request(params: dict):
-    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
-    signature = hmac.new(SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    return f"{query_string}&signature={signature}"
+    sorted_params = sorted(params.items())
+    query_string = '&'.join([f"{k}={v}" for k, v in sorted_params])
+    signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    return signature
 
-# === PLACE ORDER ===
-def place_order(side: str):
-    endpoint = "/api/v3/order"
+
+# === PLACE FUTURES ORDER ===
+def place_futures_order(side: str):
+    endpoint = "/api/v1/private/order/submit"
     url = BASE_URL + endpoint
 
     timestamp = int(time.time() * 1000)
     params = {
         "symbol": SYMBOL,
-        "side": side.upper(),
-        "type": "MARKET",
-        "quoteOrderQty": TRADE_AMOUNT,  # Spend this much USDT per trade
-        "timestamp": timestamp,
+        "price": 0,  # 0 = market order when orderType=1
+        "vol": TRADE_SIZE_USDT,  # amount in USDT
+        "leverage": LEVERAGE,
+        "side": 1 if side.upper() == "LONG" else 2,  # 1 = open long, 2 = open short
+        "type": 1,  # 1 = market order
+        "open_type": 1,  # 1 = isolated margin
+        "position_id": 0,
+        "external_oid": str(timestamp),
+        "stop_loss_price": 0,
+        "take_profit_price": 0,
+        "timestamp": timestamp
     }
 
-    signed_query = sign_request(params)
-    headers = {"X-MEXC-APIKEY": API_KEY}
+    signature = sign_request(params)
+    headers = {
+        "Content-Type": "application/json",
+        "ApiKey": API_KEY,
+        "Request-Time": str(timestamp),
+        "Signature": signature
+    }
 
     if DEBUG_MODE:
-        print(f"[DEBUG] Sending {side} order for ${TRADE_AMOUNT} on {SYMBOL}")
+        print(f"[DEBUG] Sending {side.upper()} order — {TRADE_SIZE_USDT} USDT @ {LEVERAGE}x leverage")
 
-    response = requests.post(url, headers=headers, data=signed_query)
+    response = requests.post(url, headers=headers, json=params)
     print(f"[MEXC RESPONSE] {response.status_code} - {response.text}")
     return response.json()
 
-# === MAIN ROUTE ===
+
+# === CLOSE ALL POSITIONS ===
+def close_all_positions():
+    endpoint = "/api/v1/private/position/close-all"
+    url = BASE_URL + endpoint
+    timestamp = int(time.time() * 1000)
+    params = {"timestamp": timestamp}
+    signature = sign_request(params)
+
+    headers = {
+        "ApiKey": API_KEY,
+        "Request-Time": str(timestamp),
+        "Signature": signature
+    }
+
+    response = requests.post(url, headers=headers, json=params)
+    print(f"[MEXC CLOSE RESPONSE] {response.status_code} - {response.text}")
+    return response.json()
+
+
+# === WEBHOOK ROUTE ===
 @app.route('/paper_trade', methods=['POST'])
-def paper_trade():
+def webhook():
     data = request.get_json(force=True)
     print("Received webhook:", data)
 
     if not data or "action" not in data:
-        return jsonify({"error": "Missing 'action' field"}), 400
+        return jsonify({"error": "Missing 'action'"}), 400
 
     action = data["action"].upper()
 
     if action == "LONG":
-        result = place_order("BUY")
+        result = place_futures_order("LONG")
     elif action == "SHORT":
-        result = place_order("SELL")
+        result = place_futures_order("SHORT")
+    elif action == "CLOSE":
+        result = close_all_positions()
     else:
         return jsonify({"error": "Invalid action"}), 400
 
     return jsonify({"status": "ok", "result": result}), 200
 
-# === TEST ROUTE ===
+
+# === STATUS ROUTE ===
 @app.route('/', methods=['GET'])
 def home():
-    return "✅ MEXC Bot Webhook Active", 200
+    return "✅ MEXC Futures Bot is running", 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
