@@ -21,15 +21,15 @@ def test_mexc_connection():
     api_secret = os.getenv('MEXC_API_SECRET')
     
     if not api_key or not api_secret:
-        return jsonify({"error": "API keys not set"}), 400
+    return jsonify({"error": "API keys not set"}), 400
 
     url = "https://api.mexc.com/api/v3/time"
     try:
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            return jsonify({"status": "✅ Connected to MEXC API successfully!"})
-        else:
-            return jsonify({"error": "Failed to connect", "code": res.status_code}), 400
+    res = requests.get(url, timeout=10)
+    if res.status_code == 200:
+    return jsonify({"status": "✅ Connected to MEXC API successfully!"})
+    else:
+    return jsonify({"error": "Failed to connect", "code": res.status_code}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
