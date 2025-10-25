@@ -1,55 +1,61 @@
 from flask import Flask, request, jsonify
 import os
 import time
-import hmac
-import hashlib
-import requests
 
 app = Flask(__name__)
 
+# ========================
+# === CONNECTION CHECK ===
+# ========================
 @app.route('/')
 def home():
-    return "✅ MEXC Trading Bot is Running on Render!"
+    return jsonify({"status": "✅ Connected to MEXC API successfully!"})
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
-    print("Webhook received:", data)
-    # For now, just print the incoming alert
-    return jsonify({"status": "ok", "data": data}), 200
 
-if __name__ == "__main__":
-    @app.route('/test', methods=['GET'])
-    def test_mexc_connection():
-        api_key = os.getenv('MEXC_API_KEY')
-        api_secret = os.getenv('MEXC_API_SECRET')
+# ============================
+# === TESTING ENDPOINT =======
+# ============================
+@app.route('/test', methods=['GET'])
+def test_connection():
+    return jsonify({"status": "✅ Render server is alive!", "time": time.strftime("%Y-%m-%d %H:%M:%S")})
 
-        if not api_key or not api_secret:
-            return jsonify({"error": "API keys not set"}), 400
 
-        url = "https://api.mexc.com/api/v3/time"
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                return jsonify({"status": "✅ Connected to MEXC API successfully!"})
-            else:
-                return jsonify({"error": "Failed to connect", "code": res.status_code}), 400
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-import threading
+# ===================================
+# === PAPER TRADE SIMULATION ========
+# ===================================
+@app.route('/paper_trade', methods=['POST'])
+def paper_trade():
+    data = request.get_json(force=True)
 
-def keep_alive():
-    def ping():
-        while True:
-            try:
-                requests.get("https://mexc-bot-1-my6a.onrender.com/test")
-            except:
-                pass
-            time.sleep(600)  # 600 sec = 10 min
-    thread = threading.Thread(target=ping)
-    thread.daemon = True
-    thread.start()
+    # Extract signal data
+    action = data.get('action', '').upper()
+    ticker = data.get('ticker', 'UNKNOWN')
+    price = data.get('price', 'N/A')
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
-keep_alive()
+    # Validate action
+    if action not in ['LONG', 'SHORT', 'CLOSE']:
+        return jsonify({"error": "Invalid action received"}), 400
 
-app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Log fake trade
+    print(f"[{timestamp}] 📊 PAPER TRADE -> {action} {ticker} @ {price}")
+
+    # Save to a text file for history (optional)
+    with open("paper_trades.log", "a") as f:
+        f.write(f"{timestamp} - {action} {ticker} @ {price}\n")
+
+    return jsonify({
+        "status": "✅ Paper trade executed",
+        "action": action,
+        "ticker": ticker,
+        "price": price,
+        "timestamp": timestamp
+    })
+
+
+# ========================
+# === START SERVER =======
+# ========================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
