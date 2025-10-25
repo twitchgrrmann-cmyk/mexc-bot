@@ -1,79 +1,76 @@
-from flask import Flask, request, jsonify
 import os
 import time
 import hmac
 import hashlib
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# === MEXC API CONFIG ===
-API_KEY = os.getenv("MEXC_API_KEY")
-API_SECRET = os.getenv("MEXC_API_SECRET")
+# Load your API keys from environment variables (set in Render dashboard)
+API_KEY = os.environ.get("MEXC_API_KEY")
+SECRET_KEY = os.environ.get("MEXC_SECRET_KEY")
 
-BASE_URL = "https://api.mexc.com"  # change to testnet if needed: https://testnet.mexc.com
+# === SETTINGS ===
+BASE_URL = "https://api.mexc.com"  # Spot API endpoint
+SYMBOL = "LTCUSDT"
+TRADE_AMOUNT = 10  # USD value per trade
+DEBUG_MODE = True  # Set False when live
 
-# === UTIL: CREATE SIGNATURE ===
+# === HELPER: SIGN REQUEST ===
 def sign_request(params: dict):
     query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
-    signature = hmac.new(API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    signature = hmac.new(SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     return f"{query_string}&signature={signature}"
 
-# === ROUTE: TEST CONNECTION ===
-@app.route('/test', methods=['GET'])
-def test_mexc_connection():
-    if not API_KEY or not API_SECRET:
-        return jsonify({"error": "API keys not set"}), 400
-    try:
-        res = requests.get(f"{BASE_URL}/api/v3/time", timeout=10)
-        if res.status_code == 200:
-            return jsonify({"status": "✅ Connected to MEXC API successfully!"})
-        else:
-            return jsonify({"error": "Failed to connect", "code": res.status_code}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# === PLACE ORDER ===
+def place_order(side: str):
+    endpoint = "/api/v3/order"
+    url = BASE_URL + endpoint
 
-# === ROUTE: PAPER TRADE ===
-@app.route('/paper_trade', methods=['POST'])
-def paper_trade():
-    data = request.get_json()
-    print("Received webhook:", data)
-
-    if not data or 'action' not in data:
-        return jsonify({"error": "Invalid payload"}), 400
-
-    action = data['action'].upper()
-    symbol = data.get("symbol", "LTCUSDT")  # default if not sent
-    quantity = data.get("qty", 0.1)          # adjustable trade size
-
-    # Validate action
-    if action not in ["LONG", "SHORT"]:
-        return jsonify({"error": "Invalid action"}), 400
-
-    # Create order params
+    timestamp = int(time.time() * 1000)
     params = {
-        "symbol": symbol,
-        "side": "BUY" if action == "LONG" else "SELL",
+        "symbol": SYMBOL,
+        "side": side.upper(),
         "type": "MARKET",
-        "quantity": quantity,
-        "timestamp": int(time.time() * 1000)
+        "quoteOrderQty": TRADE_AMOUNT,  # Spend this much USDT per trade
+        "timestamp": timestamp,
     }
 
     signed_query = sign_request(params)
     headers = {"X-MEXC-APIKEY": API_KEY}
 
-    try:
-        response = requests.post(f"{BASE_URL}/api/v3/order", headers=headers, data=signed_query)
-        if response.status_code == 200:
-            print("✅ Order placed:", response.json())
-            return jsonify({"status": "Trade executed", "details": response.json()}), 200
-        else:
-            print("❌ Order failed:", response.text)
-            return jsonify({"error": "Order failed", "response": response.text}), 400
-    except Exception as e:
-        print("❌ Exception during trade:", str(e))
-        return jsonify({"error": str(e)}), 500
+    if DEBUG_MODE:
+        print(f"[DEBUG] Sending {side} order for ${TRADE_AMOUNT} on {SYMBOL}")
 
+    response = requests.post(url, headers=headers, data=signed_query)
+    print(f"[MEXC RESPONSE] {response.status_code} - {response.text}")
+    return response.json()
+
+# === MAIN ROUTE ===
+@app.route('/paper_trade', methods=['POST'])
+def paper_trade():
+    data = request.get_json(force=True)
+    print("Received webhook:", data)
+
+    if not data or "action" not in data:
+        return jsonify({"error": "Missing 'action' field"}), 400
+
+    action = data["action"].upper()
+
+    if action == "LONG":
+        result = place_order("BUY")
+    elif action == "SHORT":
+        result = place_order("SELL")
+    else:
+        return jsonify({"error": "Invalid action"}), 400
+
+    return jsonify({"status": "ok", "result": result}), 200
+
+# === TEST ROUTE ===
+@app.route('/', methods=['GET'])
+def home():
+    return "✅ MEXC Bot Webhook Active", 200
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=10000)
