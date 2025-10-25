@@ -36,5 +36,20 @@ if __name__ == "__main__":
                 return jsonify({"error": "Failed to connect", "code": res.status_code}), 400
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+import threading
+
+def keep_alive():
+    def ping():
+        while True:
+            try:
+                requests.get("https://mexc-bot-1-my6a.onrender.com/test")
+            except:
+                pass
+            time.sleep(600)  # 600 sec = 10 min
+    thread = threading.Thread(target=ping)
+    thread.daemon = True
+    thread.start()
+
+keep_alive()
 
 app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
