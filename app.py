@@ -9,6 +9,8 @@ import hashlib
 import requests
 import time
 import json
+import base64
+import os
 from datetime import datetime
 
 app = Flask(__name__)
@@ -16,10 +18,11 @@ app = Flask(__name__)
 # ===================================
 # CONFIGURATION - EDIT THESE
 # ===================================
-BITGET_API_KEY = "bg_645ac59fdc8a6eb132299a049d8d1236"
-BITGET_SECRET_KEY = "be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd"
-BITGET_PASSPHRASE = "Grrtrades"
-WEBHOOK_SECRET = "Grrtrades"  # Must match TradingView
+# Get from environment variables (for Render deployment)
+BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'bg_645ac59fdc8a6eb132299a049d8d1236')
+BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd')
+BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'Grrtrades')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 # Trading Settings
 SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
@@ -46,7 +49,8 @@ def generate_signature(timestamp, method, request_path, body, secret):
         message.encode('utf-8'),
         hashlib.sha256
     )
-    return mac.digest().base64encode().decode()
+    # Fix: Use base64 module correctly
+    return base64.b64encode(mac.digest()).decode()
 
 def bitget_request(method, endpoint, params=None):
     """Make authenticated request to Bitget API"""
