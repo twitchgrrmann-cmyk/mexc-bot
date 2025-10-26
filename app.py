@@ -19,7 +19,6 @@ app = Flask(__name__)
 # ===================================
 # CONFIGURATION - EDIT THESE
 # ===================================
-# Get from environment variables (for Render deployment)
 BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'bg_645ac59fdc8a6eb132299a049d8d1236')
 BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd')
 BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'Grrtrades')
@@ -34,23 +33,8 @@ MARGIN_MODE = os.environ.get('MARGIN_MODE', 'isolated')
 BASE_URL = "https://api.bitget.com"
 
 # Keep-alive settings
-RENDER_URL = os.environ.get('RENDER_URL', '')  # Set this in Render env vars
+RENDER_URL = os.environ.get('RENDER_URL', '')
 KEEP_ALIVE = os.environ.get('KEEP_ALIVE', 'true').lower() == 'true'
-
-# ===================================
-# KEEP-ALIVE FUNCTION
-# ===================================
-
-def keep_alive_ping():
-    """Ping self every 10 minutes to prevent Render sleep"""
-    while True:
-        time.sleep(600)  # Sleep 10 minutes
-        if KEEP_ALIVE and RENDER_URL:
-            try:
-                response = requests.get(f"{RENDER_URL}/health", timeout=5)
-                print(f"[Keep-Alive] Pinged self: {response.status_code}")
-            except Exception as e:
-                print(f"[Keep-Alive] Ping failed: {e}")
 
 # ===================================
 # BITGET API FUNCTIONS
@@ -69,7 +53,6 @@ def generate_signature(timestamp, method, request_path, body, secret):
         message.encode('utf-8'),
         hashlib.sha256
     )
-    # Fix: Use base64 module correctly
     return base64.b64encode(mac.digest()).decode()
 
 def bitget_request(method, endpoint, params=None):
@@ -82,7 +65,6 @@ def bitget_request(method, endpoint, params=None):
     else:
         body = None
     
-    # Generate signature
     sign = generate_signature(timestamp, method, request_path, body, BITGET_SECRET_KEY)
     
     headers = {
@@ -116,12 +98,11 @@ def set_leverage(symbol, leverage, margin_mode):
         'symbol': symbol,
         'marginCoin': 'USDT',
         'leverage': leverage,
-        'holdSide': 'long'  # Set for both sides
+        'holdSide': 'long'
     }
     result = bitget_request("POST", endpoint, params)
     print(f"Set leverage to {leverage}x: {result}")
     
-    # Set for short side
     params['holdSide'] = 'short'
     result2 = bitget_request("POST", endpoint, params)
     print(f"Set leverage (short) to {leverage}x: {result2}")
@@ -200,16 +181,32 @@ def close_all_positions(symbol):
 def webhook():
     if request.method == 'GET':
         return jsonify({"status": "Webhook endpoint live"}), 200
+    
     """Receive TradingView webhook with position size"""
     try:
-        data = request.json
+        # TradingView sends data as plain text, not JSON with proper headers
+        # We need to parse it manually
+        
+        # Get raw data
+        raw_data = request.get_data(as_text=True)
+        print(f"\n[RAW] Received webhook data: {raw_data}")
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(raw_data)
+        except json.JSONDecodeError:
+            print(f"❌ Failed to parse JSON from: {raw_data}")
+            return jsonify({'error': 'Invalid JSON format'}), 400
+        
+        print(f"[PARSED] Data: {json.dumps(data, indent=2)}")
         
         # Verify secret (security)
         if data.get('secret') != WEBHOOK_SECRET:
+            print(f"❌ Invalid secret: got '{data.get('secret')}', expected '{WEBHOOK_SECRET}'")
             return jsonify({'error': 'Invalid secret'}), 401
         
         action = data.get('action', '').upper()
-        tv_qty = float(data.get('qty', 0))  # Qty from TradingView
+        tv_qty = float(data.get('qty', 0))
         leverage_from_tv = data.get('leverage', LEVERAGE)
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
@@ -217,15 +214,10 @@ def webhook():
         print(f"Received signal: {action}")
         print(f"TradingView Qty: {tv_qty} LTC")
         print(f"Leverage: {leverage_from_tv}x")
-        print(f"Full data: {json.dumps(data, indent=2)}")
         
-        # Validate qty
-        if tv_qty <= 0:
+        # Validate qty for BUY/SELL (CLOSE can have qty=0)
+        if action in ['BUY', 'SELL', 'LONG', 'SHORT'] and tv_qty <= 0:
             return jsonify({'error': 'Invalid qty from TradingView'}), 400
-        
-        # Apply 95% safety buffer (for fees/slippage)
-        safe_qty = tv_qty * 0.95
-        print(f"Safe Qty (95%): {safe_qty} LTC")
         
         # Get current price
         price = get_current_price(SYMBOL)
@@ -234,16 +226,17 @@ def webhook():
         
         print(f"Current {SYMBOL} price: ${price}")
         
-        # Bitget uses quantity in coins directly (not contracts)
-        # Round to 1 decimal place (Bitget's typical precision for LTC)
-        quantity = round(safe_qty, 1)
-        quantity = max(quantity, 0.1)  # Minimum 0.1 LTC
-        
-        print(f"Bitget Quantity: {quantity} LTC")
-        print(f"Position Value: ${quantity * price:.2f}")
-        
         # Execute trade based on action
         if action == 'BUY' or action == 'LONG':
+            # Apply 95% safety buffer (for fees/slippage)
+            safe_qty = tv_qty * 0.95
+            quantity = round(safe_qty, 1)
+            quantity = max(quantity, 0.1)
+            
+            print(f"Safe Qty (95%): {safe_qty} LTC")
+            print(f"Bitget Quantity: {quantity} LTC")
+            print(f"Position Value: ${quantity * price:.2f}")
+            
             # Close any short positions first
             close_all_positions(SYMBOL)
             # Open long position
@@ -251,6 +244,15 @@ def webhook():
             print(f"✅ LONG order placed: {quantity} LTC")
             
         elif action == 'SELL' or action == 'SHORT':
+            # Apply 95% safety buffer
+            safe_qty = tv_qty * 0.95
+            quantity = round(safe_qty, 1)
+            quantity = max(quantity, 0.1)
+            
+            print(f"Safe Qty (95%): {safe_qty} LTC")
+            print(f"Bitget Quantity: {quantity} LTC")
+            print(f"Position Value: ${quantity * price:.2f}")
+            
             # Close any long positions first
             close_all_positions(SYMBOL)
             # Open short position
@@ -262,9 +264,10 @@ def webhook():
             close_all_positions(SYMBOL)
             result = {'code': '00000', 'msg': 'Positions closed'}
             print(f"✅ All positions closed")
+            quantity = 0
             
         else:
-            return jsonify({'error': 'Invalid action'}), 400
+            return jsonify({'error': f'Invalid action: {action}'}), 400
         
         print(f"═══════════════════════════════\n")
         
@@ -273,10 +276,8 @@ def webhook():
             'action': action,
             'symbol': SYMBOL,
             'tradingview_qty': tv_qty,
-            'safe_qty': safe_qty,
-            'executed_qty': quantity,
+            'executed_qty': quantity if action != 'CLOSE' else 0,
             'price': price,
-            'position_value': quantity * price,
             'result': result,
             'timestamp': timestamp
         })
@@ -326,14 +327,12 @@ if __name__ == '__main__':
     print(f"Symbol: {SYMBOL}")
     print(f"Leverage: {LEVERAGE}x")
     print(f"Margin Mode: {MARGIN_MODE}")
-    print(f"Webhook URL: http://YOUR_IP:5000/webhook")
+    print(f"Webhook Secret: {WEBHOOK_SECRET}")
     print("="*50)
     
     # Set leverage and margin mode on startup
     set_leverage(SYMBOL, LEVERAGE, MARGIN_MODE)
     set_margin_mode(SYMBOL, MARGIN_MODE)
     
-       
     # Run Flask server
-    # For production, use: gunicorn -w 1 -b 0.0.0.0:5000 bot:app
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
