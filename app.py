@@ -22,9 +22,9 @@ BITGET_PASSPHRASE = "Grrtrades"
 WEBHOOK_SECRET = "Grrtrades"  # Must match TradingView
 
 # Trading Settings
-SYMBOL = "LTCUSDT_UMCBL"  # Bitget futures format (USDT-M perpetual)
-LEVERAGE = 9
-MARGIN_MODE = "isolated"  # or "crossed"
+SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
+LEVERAGE = int(os.environ.get('LEVERAGE', 9))
+MARGIN_MODE = os.environ.get('MARGIN_MODE', 'isolated')
 
 # Bitget API Endpoints
 BASE_URL = "https://api.bitget.com"
