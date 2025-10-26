@@ -11,6 +11,7 @@ import time
 import json
 import base64
 import os
+import threading
 from datetime import datetime
 
 app = Flask(__name__)
@@ -19,10 +20,10 @@ app = Flask(__name__)
 # CONFIGURATION - EDIT THESE
 # ===================================
 # Get from environment variables (for Render deployment)
-BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'bg_645ac59fdc8a6eb132299a049d8d1236')
-BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd')
-BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'Grrtrades')
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
+BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'YOUR_BITGET_API_KEY_HERE')
+BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'YOUR_BITGET_SECRET_KEY_HERE')
+BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'YOUR_BITGET_PASSPHRASE_HERE')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'YOUR_SECRET_PASSWORD_HERE')
 
 # Trading Settings
 SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
@@ -31,6 +32,25 @@ MARGIN_MODE = os.environ.get('MARGIN_MODE', 'isolated')
 
 # Bitget API Endpoints
 BASE_URL = "https://api.bitget.com"
+
+# Keep-alive settings
+RENDER_URL = os.environ.get('RENDER_URL', '')  # Set this in Render env vars
+KEEP_ALIVE = os.environ.get('KEEP_ALIVE', 'true').lower() == 'true'
+
+# ===================================
+# KEEP-ALIVE FUNCTION
+# ===================================
+
+def keep_alive_ping():
+    """Ping self every 10 minutes to prevent Render sleep"""
+    while True:
+        time.sleep(600)  # Sleep 10 minutes
+        if KEEP_ALIVE and RENDER_URL:
+            try:
+                response = requests.get(f"{RENDER_URL}/health", timeout=5)
+                print(f"[Keep-Alive] Pinged self: {response.status_code}")
+            except Exception as e:
+                print(f"[Keep-Alive] Ping failed: {e}")
 
 # ===================================
 # BITGET API FUNCTIONS
@@ -305,11 +325,21 @@ if __name__ == '__main__':
     print(f"Leverage: {LEVERAGE}x")
     print(f"Margin Mode: {MARGIN_MODE}")
     print(f"Webhook URL: http://YOUR_IP:5000/webhook")
+    if KEEP_ALIVE and RENDER_URL:
+        print(f"Keep-Alive: ENABLED (pinging {RENDER_URL} every 10min)")
+    else:
+        print(f"Keep-Alive: DISABLED")
     print("="*50)
     
     # Set leverage and margin mode on startup
     set_leverage(SYMBOL, LEVERAGE, MARGIN_MODE)
     set_margin_mode(SYMBOL, MARGIN_MODE)
+    
+    # Start keep-alive thread if enabled
+    if KEEP_ALIVE and RENDER_URL:
+        keep_alive_thread = threading.Thread(target=keep_alive_ping, daemon=True)
+        keep_alive_thread.start()
+        print("✅ Keep-alive thread started")
     
     # Run Flask server
     # For production, use: gunicorn -w 1 -b 0.0.0.0:5000 bot:app
