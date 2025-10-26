@@ -1,6 +1,7 @@
 """
-Bitget TradingView Webhook Bot
-Receives signals from TradingView and executes on Bitget Futures
+Bitget TradingView Webhook Bot - Virtual Balance Tracking
+Starts with specified amount and compounds internally
+Tracks P&L and calculates position sizes from virtual balance
 """
 
 from flask import Flask, request, jsonify
@@ -11,30 +12,124 @@ import time
 import json
 import base64
 import os
-import threading
 from datetime import datetime
 
 app = Flask(__name__)
 
 # ===================================
-# CONFIGURATION - EDIT THESE
+# CONFIGURATION
 # ===================================
-BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'bg_645ac59fdc8a6eb132299a049d8d1236')
-BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd')
-BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'Grrtrades')
+BITGET_API_KEY = os.environ.get('BITGET_API_KEY', '')
+BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', '')
+BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 # Trading Settings
 SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
 LEVERAGE = int(os.environ.get('LEVERAGE', 9))
 MARGIN_MODE = os.environ.get('MARGIN_MODE', 'isolated')
+RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 95.0))
+
+# Virtual Balance Settings
+STARTING_BALANCE = float(os.environ.get('STARTING_BALANCE', 5.0))  # Start with $5 (or whatever you set)
 
 # Bitget API Endpoints
 BASE_URL = "https://api.bitget.com"
 
-# Keep-alive settings
-RENDER_URL = os.environ.get('RENDER_URL', '')
-KEEP_ALIVE = os.environ.get('KEEP_ALIVE', 'true').lower() == 'true'
+# ===================================
+# VIRTUAL BALANCE TRACKING
+# ===================================
+class VirtualBalance:
+    """Tracks bot's virtual balance and P&L"""
+    
+    def __init__(self, starting_balance):
+        self.starting_balance = starting_balance
+        self.current_balance = starting_balance
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_pnl = 0.0
+        self.current_position = None  # {'side': 'long/short', 'entry_price': X, 'qty': Y}
+        self.trade_history = []
+    
+    def open_position(self, side, entry_price, qty):
+        """Record position opening"""
+        self.current_position = {
+            'side': side,
+            'entry_price': entry_price,
+            'qty': qty,
+            'open_time': datetime.now().isoformat()
+        }
+        print(f"📝 Position recorded: {side} {qty} @ ${entry_price}")
+    
+    def close_position(self, exit_price):
+        """Calculate P&L and update balance"""
+        if not self.current_position:
+            print("⚠️ No position to close")
+            return 0
+        
+        side = self.current_position['side']
+        entry_price = self.current_position['entry_price']
+        qty = self.current_position['qty']
+        
+        # Calculate P&L
+        if side == 'long':
+            price_change = (exit_price - entry_price) / entry_price
+        else:  # short
+            price_change = (entry_price - exit_price) / entry_price
+        
+        position_value = qty * entry_price
+        pnl = position_value * price_change * LEVERAGE
+        
+        # Update balance
+        self.current_balance += pnl
+        self.total_pnl += pnl
+        self.total_trades += 1
+        
+        if pnl > 0:
+            self.winning_trades += 1
+        else:
+            self.losing_trades += 1
+        
+        # Record trade
+        trade_record = {
+            'side': side,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'qty': qty,
+            'pnl': pnl,
+            'balance_after': self.current_balance,
+            'close_time': datetime.now().isoformat()
+        }
+        self.trade_history.append(trade_record)
+        
+        print(f"💰 Position closed:")
+        print(f"   Entry: ${entry_price:.2f} → Exit: ${exit_price:.2f}")
+        print(f"   P&L: ${pnl:+.2f}")
+        print(f"   New Balance: ${self.current_balance:.2f}")
+        
+        self.current_position = None
+        return pnl
+    
+    def get_stats(self):
+        """Get current statistics"""
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        roi = ((self.current_balance - self.starting_balance) / self.starting_balance * 100)
+        
+        return {
+            'starting_balance': self.starting_balance,
+            'current_balance': self.current_balance,
+            'total_pnl': self.total_pnl,
+            'roi_percent': roi,
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'losing_trades': self.losing_trades,
+            'win_rate': win_rate,
+            'has_open_position': self.current_position is not None
+        }
+
+# Initialize virtual balance
+virtual_balance = VirtualBalance(STARTING_BALANCE)
 
 # ===================================
 # BITGET API FUNCTIONS
@@ -91,7 +186,7 @@ def bitget_request(method, endpoint, params=None):
         print(f"API Error: {e}")
         return None
 
-def set_leverage(symbol, leverage, margin_mode):
+def set_leverage(symbol, leverage):
     """Set leverage for symbol"""
     endpoint = "/api/mix/v1/account/setLeverage"
     params = {
@@ -101,7 +196,7 @@ def set_leverage(symbol, leverage, margin_mode):
         'holdSide': 'long'
     }
     result = bitget_request("POST", endpoint, params)
-    print(f"Set leverage to {leverage}x: {result}")
+    print(f"Set leverage (long) to {leverage}x: {result}")
     
     params['holdSide'] = 'short'
     result2 = bitget_request("POST", endpoint, params)
@@ -133,12 +228,45 @@ def get_current_price(symbol):
         print(f"Price fetch error: {e}")
     return None
 
+def calculate_position_size(balance, price, leverage, risk_pct=95.0):
+    """
+    Calculate position size based on virtual balance
+    
+    Args:
+        balance: Virtual balance
+        price: Current price of asset
+        leverage: Leverage multiplier
+        risk_pct: Percentage of balance to use
+    
+    Returns:
+        Position size in coins
+    """
+    # Use risk percentage of balance
+    usable_balance = balance * (risk_pct / 100.0)
+    
+    # Calculate position value with leverage
+    position_value = usable_balance * leverage
+    
+    # Calculate quantity in coins
+    quantity = position_value / price
+    
+    # Round to 1 decimal
+    quantity = round(quantity, 1)
+    
+    # Ensure minimum
+    quantity = max(quantity, 0.1)
+    
+    print(f"📊 Position Calculation:")
+    print(f"   Virtual Balance: ${balance:.2f}")
+    print(f"   Usable ({risk_pct}%): ${usable_balance:.2f}")
+    print(f"   Leverage: {leverage}x")
+    print(f"   Position Value: ${position_value:.2f}")
+    print(f"   Quantity: {quantity} coins")
+    
+    return quantity
+
 def place_order(symbol, side, size):
-    """
-    Place market order on Bitget
-    side: 'open_long', 'close_long', 'open_short', 'close_short'
-    size: quantity in contracts (LTC)
-    """
+    """Place market order on Bitget"""
     endpoint = "/api/mix/v1/order/placeOrder"
     
     params = {
@@ -171,7 +299,7 @@ def close_all_positions(symbol):
                 side = 'close_long' if pos['holdSide'] == 'long' else 'close_short'
                 size = abs(float(pos['total']))
                 place_order(symbol, side, size)
-                print(f"Closed {pos['holdSide']} position: {size} contracts")
+                print(f"✅ Closed {pos['holdSide']} position: {size} contracts")
 
 # ===================================
 # WEBHOOK ENDPOINT
@@ -180,106 +308,123 @@ def close_all_positions(symbol):
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
-        return jsonify({"status": "Webhook endpoint live"}), 200
+        stats = virtual_balance.get_stats()
+        return jsonify({
+            "status": "Webhook endpoint live",
+            "mode": "VIRTUAL_BALANCE_TRACKING",
+            **stats
+        }), 200
     
-    """Receive TradingView webhook with position size"""
+    """Receive TradingView webhook"""
     try:
-        # TradingView sends data as plain text, not JSON with proper headers
-        # We need to parse it manually
-        
         # Get raw data
         raw_data = request.get_data(as_text=True)
-        print(f"\n[RAW] Received webhook data: {raw_data}")
+        print(f"\n[RAW] Received: {raw_data}")
         
-        # Try to parse as JSON
+        # Parse JSON
         try:
             data = json.loads(raw_data)
         except json.JSONDecodeError:
-            print(f"❌ Failed to parse JSON from: {raw_data}")
-            return jsonify({'error': 'Invalid JSON format'}), 400
+            return jsonify({'error': 'Invalid JSON'}), 400
         
-        print(f"[PARSED] Data: {json.dumps(data, indent=2)}")
-        
-        # Verify secret (security)
+        # Verify secret
         if data.get('secret') != WEBHOOK_SECRET:
-            print(f"❌ Invalid secret: got '{data.get('secret')}', expected '{WEBHOOK_SECRET}'")
             return jsonify({'error': 'Invalid secret'}), 401
         
         action = data.get('action', '').upper()
-        tv_qty = float(data.get('qty', 0))
-        leverage_from_tv = data.get('leverage', LEVERAGE)
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         print(f"\n[{timestamp}] ═══════════════════════════════")
-        print(f"Received signal: {action}")
-        print(f"TradingView Qty: {tv_qty} LTC")
-        print(f"Leverage: {leverage_from_tv}x")
+        print(f"🎯 Signal: {action}")
         
-        # Validate qty for BUY/SELL (CLOSE can have qty=0)
-        if action in ['BUY', 'SELL', 'LONG', 'SHORT'] and tv_qty <= 0:
-            return jsonify({'error': 'Invalid qty from TradingView'}), 400
+        # Get current stats
+        stats = virtual_balance.get_stats()
+        print(f"💰 Virtual Balance: ${stats['current_balance']:.2f}")
+        print(f"📈 Total P&L: ${stats['total_pnl']:+.2f} ({stats['roi_percent']:+.1f}%)")
+        print(f"📊 Trades: {stats['total_trades']} (W:{stats['winning_trades']} L:{stats['losing_trades']})")
         
         # Get current price
         price = get_current_price(SYMBOL)
         if not price:
             return jsonify({'error': 'Could not fetch price'}), 500
         
-        print(f"Current {SYMBOL} price: ${price}")
+        print(f"💵 Current {SYMBOL} price: ${price:.2f}")
         
-        # Execute trade based on action
+        # Execute trade
         if action == 'BUY' or action == 'LONG':
-            # Apply 95% safety buffer (for fees/slippage)
-            safe_qty = tv_qty * 0.95
-            quantity = round(safe_qty, 1)
-            quantity = max(quantity, 0.1)
+            # Close any existing position first (record P&L)
+            if virtual_balance.current_position:
+                virtual_balance.close_position(price)
+                close_all_positions(SYMBOL)
             
-            print(f"Safe Qty (95%): {safe_qty} LTC")
-            print(f"Bitget Quantity: {quantity} LTC")
-            print(f"Position Value: ${quantity * price:.2f}")
+            # Calculate new position size from virtual balance
+            quantity = calculate_position_size(
+                virtual_balance.current_balance,
+                price,
+                LEVERAGE,
+                RISK_PERCENTAGE
+            )
             
-            # Close any short positions first
-            close_all_positions(SYMBOL)
-            # Open long position
+            # Execute on Bitget
             result = place_order(SYMBOL, 'open_long', quantity)
-            print(f"✅ LONG order placed: {quantity} LTC")
+            
+            # Record in virtual balance
+            virtual_balance.open_position('long', price, quantity)
+            
+            print(f"✅ LONG opened: {quantity} @ ${price:.2f}")
             
         elif action == 'SELL' or action == 'SHORT':
-            # Apply 95% safety buffer
-            safe_qty = tv_qty * 0.95
-            quantity = round(safe_qty, 1)
-            quantity = max(quantity, 0.1)
+            # Close any existing position first (record P&L)
+            if virtual_balance.current_position:
+                virtual_balance.close_position(price)
+                close_all_positions(SYMBOL)
             
-            print(f"Safe Qty (95%): {safe_qty} LTC")
-            print(f"Bitget Quantity: {quantity} LTC")
-            print(f"Position Value: ${quantity * price:.2f}")
+            # Calculate new position size from virtual balance
+            quantity = calculate_position_size(
+                virtual_balance.current_balance,
+                price,
+                LEVERAGE,
+                RISK_PERCENTAGE
+            )
             
-            # Close any long positions first
-            close_all_positions(SYMBOL)
-            # Open short position
+            # Execute on Bitget
             result = place_order(SYMBOL, 'open_short', quantity)
-            print(f"✅ SHORT order placed: {quantity} LTC")
+            
+            # Record in virtual balance
+            virtual_balance.open_position('short', price, quantity)
+            
+            print(f"✅ SHORT opened: {quantity} @ ${price:.2f}")
             
         elif action == 'CLOSE':
-            # Close all positions
-            close_all_positions(SYMBOL)
-            result = {'code': '00000', 'msg': 'Positions closed'}
-            print(f"✅ All positions closed")
-            quantity = 0
-            
+            # Close position and record P&L
+            if virtual_balance.current_position:
+                pnl = virtual_balance.close_position(price)
+                close_all_positions(SYMBOL)
+                result = {'code': '00000', 'msg': 'Position closed', 'pnl': pnl}
+                quantity = 0
+                print(f"✅ Position closed with P&L: ${pnl:+.2f}")
+            else:
+                result = {'code': '00000', 'msg': 'No position to close'}
+                quantity = 0
+                print(f"ℹ️ No open position to close")
         else:
             return jsonify({'error': f'Invalid action: {action}'}), 400
         
+        # Get updated stats
+        final_stats = virtual_balance.get_stats()
+        
+        print(f"💰 New Balance: ${final_stats['current_balance']:.2f}")
         print(f"═══════════════════════════════\n")
         
         return jsonify({
             'success': True,
             'action': action,
             'symbol': SYMBOL,
-            'tradingview_qty': tv_qty,
-            'executed_qty': quantity if action != 'CLOSE' else 0,
             'price': price,
+            'quantity': quantity if action != 'CLOSE' else 0,
             'result': result,
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'virtual_balance': final_stats
         })
         
     except Exception as e:
@@ -290,49 +435,72 @@ def webhook():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
+    """Health check with stats"""
+    stats = virtual_balance.get_stats()
     return jsonify({
         'status': 'running',
         'exchange': 'Bitget',
         'symbol': SYMBOL,
         'leverage': LEVERAGE,
-        'margin_mode': MARGIN_MODE,
+        'mode': 'VIRTUAL_BALANCE',
+        **stats,
         'timestamp': datetime.now().isoformat()
     })
 
-@app.route('/status', methods=['GET'])
-def status():
-    """Check current positions"""
-    try:
-        positions = get_positions(SYMBOL)
-        price = get_current_price(SYMBOL)
-        
-        return jsonify({
-            'price': price,
-            'positions': positions,
-            'timestamp': datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Detailed statistics"""
+    stats = virtual_balance.get_stats()
+    return jsonify({
+        **stats,
+        'recent_trades': virtual_balance.trade_history[-10:],  # Last 10 trades
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Reset virtual balance (admin only)"""
+    global virtual_balance
+    
+    # Get secret from request
+    data = request.get_json() or {}
+    if data.get('secret') != WEBHOOK_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    old_stats = virtual_balance.get_stats()
+    virtual_balance = VirtualBalance(STARTING_BALANCE)
+    
+    return jsonify({
+        'success': True,
+        'message': 'Virtual balance reset',
+        'old_stats': old_stats,
+        'new_balance': STARTING_BALANCE
+    })
 
 # ===================================
 # MAIN
 # ===================================
 
 if __name__ == '__main__':
-    print("="*50)
-    print("Bitget TradingView Webhook Bot Started")
-    print("="*50)
+    print("="*60)
+    print("🚀 Bitget Bot - Virtual Balance Challenge Mode")
+    print("="*60)
     print(f"Exchange: Bitget")
     print(f"Symbol: {SYMBOL}")
     print(f"Leverage: {LEVERAGE}x")
-    print(f"Margin Mode: {MARGIN_MODE}")
-    print(f"Webhook Secret: {WEBHOOK_SECRET}")
-    print("="*50)
+    print(f"💰 Starting Balance: ${STARTING_BALANCE:.2f}")
+    print(f"📈 Goal: See how much you can grow it!")
+    print(f"\n💡 Bot tracks its own P&L internally")
+    print(f"💡 Compounds based on virtual balance")
+    print(f"💡 Independent of actual Bitget balance")
+    print("="*60)
     
-    # Set leverage and margin mode on startup
-    set_leverage(SYMBOL, LEVERAGE, MARGIN_MODE)
+    # Set leverage and margin mode
+    set_leverage(SYMBOL, LEVERAGE)
     set_margin_mode(SYMBOL, MARGIN_MODE)
     
-    # Run Flask server
+    print(f"\n✅ Bot ready - Starting balance: ${STARTING_BALANCE:.2f}")
+    print(f"📊 Track stats at: /health or /stats endpoints\n")
+    
+    # Run Flask
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
