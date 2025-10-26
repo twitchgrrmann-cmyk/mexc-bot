@@ -20,10 +20,10 @@ app = Flask(__name__)
 # CONFIGURATION - EDIT THESE
 # ===================================
 # Get from environment variables (for Render deployment)
-BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'YOUR_BITGET_API_KEY_HERE')
-BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'YOUR_BITGET_SECRET_KEY_HERE')
-BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'YOUR_BITGET_PASSPHRASE_HERE')
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'YOUR_SECRET_PASSWORD_HERE')
+BITGET_API_KEY = os.environ.get('BITGET_API_KEY', 'bg_645ac59fdc8a6eb132299a049d8d1236')
+BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', 'be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd')
+BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', 'Grrtrades')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 # Trading Settings
 SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
