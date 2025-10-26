@@ -196,8 +196,10 @@ def close_all_positions(symbol):
 # WEBHOOK ENDPOINT
 # ===================================
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
+    if request.method == 'GET':
+        return jsonify({"status": "Webhook endpoint live"}), 200
     """Receive TradingView webhook with position size"""
     try:
         data = request.json
@@ -343,4 +345,4 @@ if __name__ == '__main__':
     
     # Run Flask server
     # For production, use: gunicorn -w 1 -b 0.0.0.0:5000 bot:app
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
