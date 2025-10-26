@@ -1,6 +1,6 @@
 """
-MEXC TradingView Webhook Bot
-Free alternative to PineConnector
+Bitget TradingView Webhook Bot
+Receives signals from TradingView and executes on Bitget Futures
 """
 
 from flask import Flask, request, jsonify
@@ -16,55 +16,67 @@ app = Flask(__name__)
 # ===================================
 # CONFIGURATION - EDIT THESE
 # ===================================
-MEXC_API_KEY = "mx0vglHSkvmiJIWAbA"
-MEXC_SECRET_KEY = "d73c9164f5ce40b192a38e804f48fe06"
-WEBHOOK_SECRET = "Grrtrades"  # Set a random password
+BITGET_API_KEY = "bg_645ac59fdc8a6eb132299a049d8d1236"
+BITGET_SECRET_KEY = "be21f86fb8e4c0b4a64d0ebbfb7ca1936d8e55099d288a8ebbb17cbc929451fd"
+BITGET_PASSPHRASE = "Grrtrades"
+WEBHOOK_SECRET = "Grrtrades"  # Must match TradingView
 
 # Trading Settings
-SYMBOL = "LTC_USDT"  # MEXC futures format
+SYMBOL = "LTCUSDT_UMCBL"  # Bitget futures format (USDT-M perpetual)
 LEVERAGE = 9
-POSITION_SIZE_USDT = 20  # How much USDT per trade
+MARGIN_MODE = "isolated"  # or "crossed"
 
-# MEXC API Endpoints
-BASE_URL = "https://contract.mexc.com"
+# Bitget API Endpoints
+BASE_URL = "https://api.bitget.com"
 
 # ===================================
-# MEXC API FUNCTIONS
+# BITGET API FUNCTIONS
 # ===================================
 
-def generate_signature(params, secret):
-    """Generate MEXC API signature"""
-    query_string = '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
-    signature = hmac.new(
-        secret.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
-
-def mexc_request(method, endpoint, params=None):
-    """Make request to MEXC API"""
-    if params is None:
-        params = {}
+def generate_signature(timestamp, method, request_path, body, secret):
+    """Generate Bitget API signature"""
+    if body:
+        body_str = json.dumps(body)
+    else:
+        body_str = ""
     
-    # Add timestamp
-    params['timestamp'] = int(time.time() * 1000)
+    message = timestamp + method + request_path + body_str
+    mac = hmac.new(
+        secret.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    )
+    return mac.digest().base64encode().decode()
+
+def bitget_request(method, endpoint, params=None):
+    """Make authenticated request to Bitget API"""
+    timestamp = str(int(time.time() * 1000))
+    request_path = endpoint
+    
+    if params:
+        body = params
+    else:
+        body = None
     
     # Generate signature
-    params['signature'] = generate_signature(params, MEXC_SECRET_KEY)
+    sign = generate_signature(timestamp, method, request_path, body, BITGET_SECRET_KEY)
     
     headers = {
-        'ApiKey': MEXC_API_KEY,
-        'Content-Type': 'application/json'
+        'ACCESS-KEY': BITGET_API_KEY,
+        'ACCESS-SIGN': sign,
+        'ACCESS-TIMESTAMP': timestamp,
+        'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
+        'Content-Type': 'application/json',
+        'locale': 'en-US'
     }
     
-    url = f"{BASE_URL}{endpoint}"
+    url = BASE_URL + request_path
     
     try:
         if method == "GET":
-            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=10)
         elif method == "POST":
-            response = requests.post(url, json=params, headers=headers, timeout=10)
+            response = requests.post(url, json=body, headers=headers, timeout=10)
         else:
             return None
         
@@ -73,74 +85,88 @@ def mexc_request(method, endpoint, params=None):
         print(f"API Error: {e}")
         return None
 
-def set_leverage(symbol, leverage):
+def set_leverage(symbol, leverage, margin_mode):
     """Set leverage for symbol"""
-    endpoint = "/api/v1/private/position/change_leverage"
+    endpoint = "/api/mix/v1/account/setLeverage"
     params = {
         'symbol': symbol,
+        'marginCoin': 'USDT',
         'leverage': leverage,
-        'openType': 1  # Isolated margin
+        'holdSide': 'long'  # Set for both sides
     }
-    result = mexc_request("POST", endpoint, params)
+    result = bitget_request("POST", endpoint, params)
     print(f"Set leverage to {leverage}x: {result}")
+    
+    # Set for short side
+    params['holdSide'] = 'short'
+    result2 = bitget_request("POST", endpoint, params)
+    print(f"Set leverage (short) to {leverage}x: {result2}")
+    return result
+
+def set_margin_mode(symbol, margin_mode):
+    """Set margin mode (isolated or crossed)"""
+    endpoint = "/api/mix/v1/account/setMarginMode"
+    params = {
+        'symbol': symbol,
+        'marginCoin': 'USDT',
+        'marginMode': margin_mode
+    }
+    result = bitget_request("POST", endpoint, params)
+    print(f"Set margin mode to {margin_mode}: {result}")
     return result
 
 def get_current_price(symbol):
     """Get current market price"""
-    endpoint = "/api/v1/contract/ticker"
-    params = {'symbol': symbol}
+    endpoint = f"/api/mix/v1/market/ticker?symbol={symbol}"
     
     try:
-        response = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10)
+        response = requests.get(BASE_URL + endpoint, timeout=10)
         data = response.json()
-        if data.get('success') and data.get('data'):
-            return float(data['data'][0]['lastPrice'])
+        if data.get('code') == '00000' and data.get('data'):
+            return float(data['data']['last'])
     except Exception as e:
         print(f"Price fetch error: {e}")
     return None
 
-def place_order(symbol, side, quantity):
+def place_order(symbol, side, size):
     """
-    Place market order on MEXC
-    side: 1 = Open Long, 2 = Close Long, 3 = Open Short, 4 = Close Short
+    Place market order on Bitget
+    side: 'open_long', 'close_long', 'open_short', 'close_short'
+    size: quantity in contracts (LTC)
     """
-    endpoint = "/api/v1/private/order/submit"
+    endpoint = "/api/mix/v1/order/placeOrder"
     
     params = {
         'symbol': symbol,
-        'price': 0,  # Market order
-        'vol': quantity,
+        'marginCoin': 'USDT',
         'side': side,
-        'type': 5,  # Market order type
-        'openType': 1,  # Isolated margin
-        'leverage': LEVERAGE
+        'orderType': 'market',
+        'size': str(size),
+        'timeInForceValue': 'normal'
     }
     
-    result = mexc_request("POST", endpoint, params)
+    result = bitget_request("POST", endpoint, params)
     print(f"Order result: {result}")
+    return result
+
+def get_positions(symbol):
+    """Get current positions"""
+    endpoint = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
+    result = bitget_request("GET", endpoint)
     return result
 
 def close_all_positions(symbol):
     """Close all open positions for symbol"""
-    # Get current position
-    endpoint = "/api/v1/private/position/open_positions"
-    params = {'symbol': symbol}
-    positions = mexc_request("GET", endpoint, params)
+    positions = get_positions(symbol)
     
-    if positions and positions.get('success'):
-        for pos in positions.get('data', []):
-            if float(pos.get('holdVol', 0)) > 0:
-                side = 2 if pos['positionType'] == 1 else 4  # 2=Close Long, 4=Close Short
-                quantity = abs(float(pos['holdVol']))
-                place_order(symbol, side, quantity)
-                print(f"Closed position: {pos['positionType']} {quantity}")
-
-def calculate_position_size(price, position_value_usdt):
-    """Calculate position size in contracts"""
-    # MEXC uses contracts, need to calculate based on contract value
-    # For LTC, 1 contract typically = 0.01 LTC
-    contracts = int((position_value_usdt / price) * 100)  # Convert to contracts
-    return max(contracts, 1)  # Minimum 1 contract
+    if positions and positions.get('code') == '00000':
+        data = positions.get('data', [])
+        for pos in data:
+            if float(pos.get('total', 0)) > 0:
+                side = 'close_long' if pos['holdSide'] == 'long' else 'close_short'
+                size = abs(float(pos['total']))
+                place_order(symbol, side, size)
+                print(f"Closed {pos['holdSide']} position: {size} contracts")
 
 # ===================================
 # WEBHOOK ENDPOINT
@@ -182,32 +208,33 @@ def webhook():
         
         print(f"Current {SYMBOL} price: ${price}")
         
-        # Convert to MEXC contracts (1 contract = 0.01 LTC typically)
-        contracts = int(safe_qty * 100)
-        contracts = max(contracts, 1)  # Minimum 1 contract
+        # Bitget uses quantity in coins directly (not contracts)
+        # Round to 1 decimal place (Bitget's typical precision for LTC)
+        quantity = round(safe_qty, 1)
+        quantity = max(quantity, 0.1)  # Minimum 0.1 LTC
         
-        print(f"MEXC Contracts: {contracts} (~{contracts/100} LTC)")
-        print(f"Position Value: ${(contracts/100) * price:.2f}")
+        print(f"Bitget Quantity: {quantity} LTC")
+        print(f"Position Value: ${quantity * price:.2f}")
         
         # Execute trade based on action
         if action == 'BUY' or action == 'LONG':
             # Close any short positions first
             close_all_positions(SYMBOL)
             # Open long position
-            result = place_order(SYMBOL, 1, contracts)  # 1 = Open Long
-            print(f"✅ LONG order placed: {contracts} contracts")
+            result = place_order(SYMBOL, 'open_long', quantity)
+            print(f"✅ LONG order placed: {quantity} LTC")
             
         elif action == 'SELL' or action == 'SHORT':
             # Close any long positions first
             close_all_positions(SYMBOL)
             # Open short position
-            result = place_order(SYMBOL, 3, contracts)  # 3 = Open Short
-            print(f"✅ SHORT order placed: {contracts} contracts")
+            result = place_order(SYMBOL, 'open_short', quantity)
+            print(f"✅ SHORT order placed: {quantity} LTC")
             
         elif action == 'CLOSE':
             # Close all positions
             close_all_positions(SYMBOL)
-            result = {'success': True, 'message': 'Positions closed'}
+            result = {'code': '00000', 'msg': 'Positions closed'}
             print(f"✅ All positions closed")
             
         else:
@@ -221,9 +248,9 @@ def webhook():
             'symbol': SYMBOL,
             'tradingview_qty': tv_qty,
             'safe_qty': safe_qty,
-            'contracts': contracts,
+            'executed_qty': quantity,
             'price': price,
-            'position_value': (contracts/100) * price,
+            'position_value': quantity * price,
             'result': result,
             'timestamp': timestamp
         })
@@ -239,8 +266,10 @@ def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'running',
+        'exchange': 'Bitget',
         'symbol': SYMBOL,
         'leverage': LEVERAGE,
+        'margin_mode': MARGIN_MODE,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -248,10 +277,7 @@ def health():
 def status():
     """Check current positions"""
     try:
-        endpoint = "/api/v1/private/position/open_positions"
-        params = {'symbol': SYMBOL}
-        positions = mexc_request("GET", endpoint, params)
-        
+        positions = get_positions(SYMBOL)
         price = get_current_price(SYMBOL)
         
         return jsonify({
@@ -268,16 +294,18 @@ def status():
 
 if __name__ == '__main__':
     print("="*50)
-    print("MEXC TradingView Webhook Bot Started")
+    print("Bitget TradingView Webhook Bot Started")
     print("="*50)
+    print(f"Exchange: Bitget")
     print(f"Symbol: {SYMBOL}")
     print(f"Leverage: {LEVERAGE}x")
-    print(f"Position Size: ${POSITION_SIZE_USDT} USDT")
+    print(f"Margin Mode: {MARGIN_MODE}")
     print(f"Webhook URL: http://YOUR_IP:5000/webhook")
     print("="*50)
     
-    # Set leverage on startup
-    set_leverage(SYMBOL, LEVERAGE)
+    # Set leverage and margin mode on startup
+    set_leverage(SYMBOL, LEVERAGE, MARGIN_MODE)
+    set_margin_mode(SYMBOL, MARGIN_MODE)
     
     # Run Flask server
     # For production, use: gunicorn -w 1 -b 0.0.0.0:5000 bot:app
