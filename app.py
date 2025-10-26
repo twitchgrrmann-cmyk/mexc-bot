@@ -327,22 +327,13 @@ if __name__ == '__main__':
     print(f"Leverage: {LEVERAGE}x")
     print(f"Margin Mode: {MARGIN_MODE}")
     print(f"Webhook URL: http://YOUR_IP:5000/webhook")
-    if KEEP_ALIVE and RENDER_URL:
-        print(f"Keep-Alive: ENABLED (pinging {RENDER_URL} every 10min)")
-    else:
-        print(f"Keep-Alive: DISABLED")
     print("="*50)
     
     # Set leverage and margin mode on startup
     set_leverage(SYMBOL, LEVERAGE, MARGIN_MODE)
     set_margin_mode(SYMBOL, MARGIN_MODE)
     
-    # Start keep-alive thread if enabled
-    if KEEP_ALIVE and RENDER_URL:
-        keep_alive_thread = threading.Thread(target=keep_alive_ping, daemon=True)
-        keep_alive_thread.start()
-        print("✅ Keep-alive thread started")
-    
+       
     # Run Flask server
     # For production, use: gunicorn -w 1 -b 0.0.0.0:5000 bot:app
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=False)
