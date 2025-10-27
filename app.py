@@ -26,7 +26,7 @@ WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 # Trading Settings
 SYMBOL = os.environ.get('SYMBOL', 'LTCUSDT_UMCBL')
-LEVERAGE = int(os.environ.get('LEVERAGE', 9))
+LEVERAGE = int(os.environ.get('LEVERAGE', 7))
 MARGIN_MODE = os.environ.get('MARGIN_MODE', 'isolated')
 RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 95.0))
 
