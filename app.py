@@ -9,6 +9,7 @@ Changes:
 - Finer rounding for quantity (3 decimals) and smaller minimums
 - LIVE_MODE toggle for testing without sending real orders
 - Adds holdSide param when placing orders (for Hedge mode compatibility)
+- FIXED: Ignores duplicate signals (LONG->LONG, SHORT->SHORT)
 """
 
 from flask import Flask, request, jsonify
@@ -426,9 +427,37 @@ def webhook():
             return jsonify({'error': 'Price fetch failed'}), 500
         print(f"💵 Current {SYMBOL} price: ${price:.2f}")
 
-        # --- SAFETY: always close open positions first (Bitget + virtual) ---
+        # ═══════════════════════════════════════════════════════════
+        # 🔧 FIXED: Check if signal matches current position
+        # ═══════════════════════════════════════════════════════════
         if virtual_balance.current_position:
-            print("🔒 Closing any open position before opening new one...")
+            current_side = virtual_balance.current_position['side']
+            
+            # Skip if trying to re-enter same side
+            if action in ['BUY', 'LONG'] and current_side == 'long':
+                print(f"ℹ️ Already LONG - ignoring duplicate signal")
+                print("═══════════════════════════════\n")
+                return jsonify({
+                    'success': True,
+                    'action': 'ignored',
+                    'reason': 'already_long',
+                    'current_position': current_side,
+                    'timestamp': timestamp
+                })
+            
+            if action in ['SELL', 'SHORT'] and current_side == 'short':
+                print(f"ℹ️ Already SHORT - ignoring duplicate signal")
+                print("═══════════════════════════════\n")
+                return jsonify({
+                    'success': True,
+                    'action': 'ignored',
+                    'reason': 'already_short',
+                    'current_position': current_side,
+                    'timestamp': timestamp
+                })
+            
+            # Only close if switching sides
+            print(f"🔄 Switching from {current_side.upper()} to opposite side...")
             virtual_balance.close_position(price)
             close_all_positions(SYMBOL)
             time.sleep(0.4)  # brief delay to ensure Bitget syncs
