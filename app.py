@@ -1,7 +1,7 @@
 """
 Patched Bitget TradingView Webhook Bot - Virtual Balance Tracking
 Changes:
-- Fixed Render timeout: Flask starts immediately, API calls deferred until first order
+- Added signal debouncing: signals arriving within DEBOUNCE_SEC are ignored
 - All other functionality preserved
 """
 
@@ -260,19 +260,23 @@ def close_all_positions(symbol):
                 print(f"✅ Closed {pos['holdSide']} position: {size} contracts")
 
 # ===================================
-# WEBHOOK HANDLER
+# WEBHOOK HANDLER WITH DEBOUNCE
 # ===================================
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     global last_signal_time
+
     if request.method == 'GET':
-        return jsonify({"status": "Webhook endpoint live", "mode": "VIRTUAL_BALANCE_TRACKING", **virtual_balance.get_stats()}), 200
+        return jsonify({"status": "Webhook endpoint live",
+                        "mode": "VIRTUAL_BALANCE_TRACKING",
+                        **virtual_balance.get_stats()}), 200
 
     raw_data = request.get_data(as_text=True)
     try:
         data = json.loads(raw_data)
     except:
         return jsonify({'error': 'Invalid JSON'}), 400
+
     if data.get('secret') != WEBHOOK_SECRET:
         return jsonify({'error': 'Invalid secret'}), 401
 
@@ -280,6 +284,21 @@ def webhook():
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n[{timestamp}] 🎯 Signal received: {action}")
 
+    # ====== DEBOUNCE CHECK ======
+    current_time = time.time()
+    if current_time - last_signal_time < DEBOUNCE_SEC:
+        print(f"⏱ Signal ignored due to debounce ({DEBOUNCE_SEC}s)")
+        return jsonify({
+            'success': True,
+            'action': action,
+            'status': 'ignored',
+            'reason': 'debounce',
+            'timestamp': timestamp
+        })
+
+    last_signal_time = current_time
+
+    # Get current market price
     price = get_current_price(SYMBOL)
     if not price:
         return jsonify({'error': 'Price fetch failed'}), 500
@@ -316,7 +335,13 @@ def webhook():
     else:
         return jsonify({'error': f'Invalid action: {action}'}), 400
 
-    return jsonify({'success': True, 'action': action, 'price': price, 'virtual_balance': virtual_balance.get_stats(), 'timestamp': timestamp})
+    return jsonify({
+        'success': True,
+        'action': action,
+        'price': price,
+        'virtual_balance': virtual_balance.get_stats(),
+        'timestamp': timestamp
+    })
 
 # ===================================
 # OTHER ENDPOINTS
@@ -324,7 +349,8 @@ def webhook():
 @app.route('/health', methods=['GET'])
 def health():
     stats = virtual_balance.get_stats()
-    return jsonify({'status': 'running', 'symbol': SYMBOL, 'leverage': LEVERAGE, 'mode': 'VIRTUAL_BALANCE', **stats, 'timestamp': datetime.now().isoformat()})
+    return jsonify({'status': 'running', 'symbol': SYMBOL, 'leverage': LEVERAGE,
+                    'mode': 'VIRTUAL_BALANCE', **stats, 'timestamp': datetime.now().isoformat()})
 
 @app.route('/stats', methods=['GET'])
 def stats():
