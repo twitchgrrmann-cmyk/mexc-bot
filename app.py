@@ -3,6 +3,7 @@ import hmac, hashlib, requests, time, json, base64, os
 from datetime import datetime
 import threading
 from collections import deque
+import traceback
 
 app = Flask(__name__)
 
@@ -15,7 +16,7 @@ BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 SYMBOL = os.environ.get('SYMBOL', 'TAOUSDT_UMCBL')
-LEVERAGE = int(os.environ.get('LEVERAGE', 100))
+LEVERAGE = int(os.environ.get('LEVERAGE', 30))
 MARGIN_MODE = 'cross'
 RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 20.0))
 STARTING_BALANCE = float(os.environ.get('STARTING_BALANCE', 20.0))
@@ -23,6 +24,7 @@ STATE_FILE = os.environ.get('STATE_FILE', 'vb_state.json')
 DEBOUNCE_SEC = float(os.environ.get('DEBOUNCE_SEC', 2.0))
 PRICE_CHECK_INTERVAL = 1.0
 MAX_PRICE_FAILURES = 5
+POSITION_SYNC_INTERVAL = 30.0  # Sync with Bitget every 30 seconds
 
 # TP/SL CONFIG - MATCHES PINE SCRIPT
 TAKE_PROFIT_PCT = float(os.environ.get('TAKE_PROFIT_PCT', 1.3))
@@ -33,7 +35,14 @@ BASE_URL = "https://api.bitget.com"
 last_signal_time = 0
 
 # =====================
-# VIRTUAL BALANCE
+# LOGGING HELPER
+# =====================
+def log(message, level="INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}")
+
+# =====================
+# VIRTUAL BALANCE WITH ENHANCED MONITORING
 # =====================
 class VirtualBalance:
     def __init__(self, starting_balance):
@@ -46,7 +55,9 @@ class VirtualBalance:
         self.current_position = None
         self.trade_history = []
         self.monitor_thread = None
+        self.sync_thread = None
         self.stop_monitoring = threading.Event()
+        self.stop_syncing = threading.Event()
         self.position_lock = threading.Lock()
         self.max_drawdown = 0.0
         self.peak_balance = starting_balance
@@ -54,11 +65,98 @@ class VirtualBalance:
         self.recent_pnls = deque(maxlen=10)
         self.daily_trade_count = 0
         self.last_trade_date = None
+        self.last_sync_time = 0
+
+    def start_sync_thread(self):
+        """Start background thread to sync with Bitget positions"""
+        if self.sync_thread is None or not self.sync_thread.is_alive():
+            self.stop_syncing.clear()
+            self.sync_thread = threading.Thread(target=self.sync_with_bitget, daemon=True)
+            self.sync_thread.start()
+            log("Started position sync thread")
+
+    def sync_with_bitget(self):
+        """Periodically check Bitget for position mismatches"""
+        while not self.stop_syncing.is_set():
+            try:
+                time.sleep(POSITION_SYNC_INTERVAL)
+                
+                # Get actual Bitget position
+                bitget_pos = get_positions(SYMBOL)
+                if bitget_pos.get('code') != '00000':
+                    continue
+                
+                positions = bitget_pos.get('data', [])
+                has_bitget_position = False
+                bitget_side = None
+                bitget_qty = 0
+                
+                for p in positions:
+                    qty = float(p.get('total', 0))
+                    if qty > 0:
+                        has_bitget_position = True
+                        bitget_side = p['holdSide']
+                        bitget_qty = qty
+                        break
+                
+                with self.position_lock:
+                    # Case 1: Bot thinks it has position, but Bitget doesn't
+                    if self.current_position and not has_bitget_position:
+                        log(f"⚠️ SYNC: Bot has position but Bitget doesn't - assuming closed externally", "WARNING")
+                        current_price = get_current_price(SYMBOL)
+                        if current_price:
+                            self.close_position(current_price, reason="external_close")
+                    
+                    # Case 2: Bitget has position, but bot doesn't know about it
+                    elif not self.current_position and has_bitget_position:
+                        log(f"⚠️ SYNC: Bitget has {bitget_side} position but bot doesn't - recovering", "WARNING")
+                        current_price = get_current_price(SYMBOL)
+                        if current_price:
+                            # Create position record and start monitoring
+                            self.current_position = {
+                                'side': bitget_side,
+                                'entry_price': current_price,
+                                'qty': bitget_qty,
+                                'tp_price': self.calculate_tp_sl(bitget_side, current_price)[0],
+                                'sl_price': self.calculate_tp_sl(bitget_side, current_price)[1],
+                                'open_time': datetime.now().isoformat(),
+                                'recovered': True
+                            }
+                            save_state()
+                            self._start_monitoring()
+                            log(f"✅ SYNC: Recovered {bitget_side} position, now monitoring")
+                    
+                    # Case 3: Both have position - verify they match
+                    elif self.current_position and has_bitget_position:
+                        if self.current_position['side'] != bitget_side:
+                            log(f"⚠️ SYNC: Side mismatch! Bot: {self.current_position['side']}, Bitget: {bitget_side}", "ERROR")
+                            # Trust Bitget and update our record
+                            current_price = get_current_price(SYMBOL)
+                            if current_price:
+                                self.close_position(current_price, reason="side_mismatch")
+                                self.current_position = {
+                                    'side': bitget_side,
+                                    'entry_price': current_price,
+                                    'qty': bitget_qty,
+                                    'tp_price': self.calculate_tp_sl(bitget_side, current_price)[0],
+                                    'sl_price': self.calculate_tp_sl(bitget_side, current_price)[1],
+                                    'open_time': datetime.now().isoformat(),
+                                    'recovered': True
+                                }
+                                save_state()
+                                self._start_monitoring()
+                
+                self.last_sync_time = time.time()
+                
+            except Exception as e:
+                log(f"Sync error: {e}\n{traceback.format_exc()}", "ERROR")
+        
+        log("Position sync thread stopped")
 
     def open_position(self, side, entry_price, qty):
         with self.position_lock:
             if self.current_position:
-                print(f"⚠️ Already have open position, skipping")
+                log(f"Already have open position, skipping", "WARNING")
                 return False
             
             tp_price, sl_price = self.calculate_tp_sl(side, entry_price)
@@ -71,13 +169,21 @@ class VirtualBalance:
                 'open_time': datetime.now().isoformat()
             }
             save_state()
-            print(f"📝 Opened {side} {qty} @ {entry_price} | TP: {tp_price:.2f}, SL: {sl_price:.2f}")
+            log(f"📝 Opened {side} {qty} @ {entry_price} | TP: {tp_price:.2f}, SL: {sl_price:.2f}")
             
             # Start monitoring thread
-            self.stop_monitoring.clear()
+            self._start_monitoring()
+            return True
+
+    def _start_monitoring(self):
+        """Start or restart monitoring thread"""
+        self.stop_monitoring.clear()
+        if self.monitor_thread is None or not self.monitor_thread.is_alive():
             self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
             self.monitor_thread.start()
-            return True
+            log("Started position monitor thread")
+        else:
+            log("Monitor thread already running")
 
     def calculate_tp_sl(self, side, entry_price):
         if side=='long':
@@ -90,51 +196,62 @@ class VirtualBalance:
 
     def monitor_position(self):
         consecutive_failures = 0
-        print(f"🔍 Started monitoring position")
+        log("🔍 Started monitoring position")
         
-        while not self.stop_monitoring.is_set():
-            with self.position_lock:
-                if not self.current_position:
-                    print(f"✅ Position closed externally, stopping monitor")
-                    break
-                
-                current_price = get_current_price(SYMBOL)
-                if not current_price:
-                    consecutive_failures += 1
-                    print(f"⚠️ Price fetch failed ({consecutive_failures}/{MAX_PRICE_FAILURES})")
-                    if consecutive_failures >= MAX_PRICE_FAILURES:
-                        print(f"❌ Max price failures reached, emergency close")
-                        self._emergency_close()
-                        break
+        try:
+            while not self.stop_monitoring.is_set():
+                try:
+                    with self.position_lock:
+                        if not self.current_position:
+                            log("Position closed externally, stopping monitor")
+                            break
+                        
+                        current_price = get_current_price(SYMBOL)
+                        if not current_price:
+                            consecutive_failures += 1
+                            log(f"Price fetch failed ({consecutive_failures}/{MAX_PRICE_FAILURES})", "WARNING")
+                            if consecutive_failures >= MAX_PRICE_FAILURES:
+                                log("Max price failures reached, emergency close", "ERROR")
+                                self._emergency_close()
+                                break
+                            time.sleep(PRICE_CHECK_INTERVAL)
+                            continue
+                        
+                        consecutive_failures = 0
+                        side = self.current_position['side']
+                        tp, sl = self.current_position['tp_price'], self.current_position['sl_price']
+                        
+                        # Check TP/SL
+                        hit_tp = (side=='long' and current_price >= tp) or (side=='short' and current_price <= tp)
+                        hit_sl = (side=='long' and current_price <= sl) or (side=='short' and current_price >= sl)
+                        
+                        if hit_tp or hit_sl:
+                            reason = "TP" if hit_tp else "SL"
+                            log(f"⚡ {reason} hit for {side} at {current_price}")
+                            close_all_positions(SYMBOL)
+                            time.sleep(1)  # Wait for close to process
+                            self.close_position(current_price, reason=reason)
+                            break
+                    
                     time.sleep(PRICE_CHECK_INTERVAL)
-                    continue
-                
-                consecutive_failures = 0
-                side = self.current_position['side']
-                tp, sl = self.current_position['tp_price'], self.current_position['sl_price']
-                
-                # Check TP/SL
-                hit_tp = (side=='long' and current_price >= tp) or (side=='short' and current_price <= tp)
-                hit_sl = (side=='long' and current_price <= sl) or (side=='short' and current_price >= sl)
-                
-                if hit_tp or hit_sl:
-                    reason = "TP" if hit_tp else "SL"
-                    print(f"⚡ {reason} hit for {side} at {current_price}")
-                    self.close_position(current_price)
-                    close_all_positions(SYMBOL)
-                    break
-            
-            time.sleep(PRICE_CHECK_INTERVAL)
+                    
+                except Exception as e:
+                    log(f"Monitor loop error: {e}\n{traceback.format_exc()}", "ERROR")
+                    time.sleep(PRICE_CHECK_INTERVAL)
         
-        print(f"🛑 Monitor thread stopped")
+        except Exception as e:
+            log(f"Monitor thread crashed: {e}\n{traceback.format_exc()}", "ERROR")
+        finally:
+            log("🛑 Monitor thread stopped")
 
     def _emergency_close(self):
         if self.current_position:
-            print(f"🚨 Emergency closing position")
+            log("🚨 Emergency closing position", "ERROR")
             close_all_positions(SYMBOL)
-            self.close_position(self.current_position['entry_price'])
+            time.sleep(1)
+            self.close_position(self.current_position['entry_price'], reason="emergency")
 
-    def close_position(self, exit_price):
+    def close_position(self, exit_price, reason="normal"):
         with self.position_lock:
             if not self.current_position:
                 return 0
@@ -184,16 +301,17 @@ class VirtualBalance:
                 'qty': qty,
                 'pnl': pnl,
                 'balance_after': self.current_balance,
-                'close_time': datetime.now().isoformat()
+                'close_time': datetime.now().isoformat(),
+                'close_reason': reason
             })
             
             self.current_position = None
             save_state()
             
-            print(f"💰 Closed {side} | P&L: {pnl:+.2f} | Balance: {self.current_balance:.2f} | DD: {drawdown:.2f}%")
+            log(f"💰 Closed {side} ({reason}) | P&L: {pnl:+.2f} | Balance: {self.current_balance:.2f} | DD: {drawdown:.2f}%")
             
             if self.consecutive_losses >= 3:
-                print(f"⚠️ WARNING: {self.consecutive_losses} consecutive losses!")
+                log(f"WARNING: {self.consecutive_losses} consecutive losses!", "WARNING")
             
             return pnl
 
@@ -201,22 +319,22 @@ class VirtualBalance:
         # Daily drawdown circuit breaker
         daily_drawdown = self._calculate_daily_drawdown()
         if daily_drawdown > 20.0:
-            print(f"🚨 DAILY CIRCUIT BREAKER: {daily_drawdown:.2f}% loss today")
+            log(f"DAILY CIRCUIT BREAKER: {daily_drawdown:.2f}% loss today", "WARNING")
             return False
         
         # Max drawdown
         if self.max_drawdown > 40:
-            print(f"🛑 Max drawdown {self.max_drawdown:.2f}% exceeded")
+            log(f"Max drawdown {self.max_drawdown:.2f}% exceeded", "WARNING")
             return False
         
         # Consecutive losses
         if self.consecutive_losses >= 5:
-            print(f"🛑 Too many consecutive losses: {self.consecutive_losses}")
+            log(f"Too many consecutive losses: {self.consecutive_losses}", "WARNING")
             return False
         
         # Balance check
         if self.current_balance < self.starting_balance * 0.3:
-            print(f"🛑 Balance too low: {self.current_balance:.2f}")
+            log(f"Balance too low: {self.current_balance:.2f}", "WARNING")
             return False
         
         return True
@@ -262,7 +380,10 @@ class VirtualBalance:
             'avg_loss': avg_loss,
             'profit_factor': abs(avg_win / avg_loss) if avg_loss != 0 else 0,
             'has_open_position': self.current_position is not None,
-            'can_trade': self.should_trade()
+            'can_trade': self.should_trade(),
+            'last_sync': datetime.fromtimestamp(self.last_sync_time).isoformat() if self.last_sync_time > 0 else 'never',
+            'monitor_alive': self.monitor_thread.is_alive() if self.monitor_thread else False,
+            'sync_alive': self.sync_thread.is_alive() if self.sync_thread else False
         }
 
 virtual_balance = VirtualBalance(STARTING_BALANCE)
@@ -288,7 +409,7 @@ def save_state():
         with open(STATE_FILE,'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
-        print(f"❌ Failed to save state: {e}")
+        log(f"Failed to save state: {e}", "ERROR")
 
 def load_state():
     global virtual_balance
@@ -307,18 +428,16 @@ def load_state():
         vb.peak_balance = st.get('peak_balance', STARTING_BALANCE)
         vb.consecutive_losses = st.get('consecutive_losses', 0)
         virtual_balance = vb
-        print("✅ Loaded virtual balance")
+        log("✅ Loaded virtual balance")
         
         # Restart monitoring if position exists
         if vb.current_position:
-            print("🔄 Restarting position monitor after reload")
-            vb.stop_monitoring.clear()
-            vb.monitor_thread = threading.Thread(target=vb.monitor_position, daemon=True)
-            vb.monitor_thread.start()
+            log("🔄 Restarting position monitor after reload")
+            vb._start_monitoring()
     except FileNotFoundError:
-        print("ℹ️ No saved state found, starting fresh")
+        log("ℹ️ No saved state found, starting fresh")
     except Exception as e:
-        print(f"❌ Failed to load state: {e}")
+        log(f"Failed to load state: {e}", "ERROR")
 
 # =====================
 # BITGET API
@@ -350,7 +469,7 @@ def bitget_request(method, endpoint, params=None, retries=3):
             
             return r.json()
         except Exception as e:
-            print(f"⚠️ API request failed (attempt {attempt+1}/{retries}): {e}")
+            log(f"API request failed (attempt {attempt+1}/{retries}): {e}", "WARNING")
             if attempt < retries - 1:
                 time.sleep(1)
     return {'error':'request_failed'}
@@ -360,13 +479,13 @@ def set_leverage(symbol, leverage):
         result = bitget_request("POST","/api/mix/v1/account/setLeverage",
                                {'symbol':symbol,'marginCoin':'USDT','leverage':leverage,'holdSide':side})
         if result.get('code') != '00000':
-            print(f"⚠️ Failed to set {side} leverage: {result}")
+            log(f"Failed to set {side} leverage: {result}", "WARNING")
 
 def set_margin_mode(symbol, margin_mode):
     result = bitget_request("POST","/api/mix/v1/account/setMarginMode",
                            {'symbol':symbol,'marginCoin':'USDT','marginMode':margin_mode})
     if result.get('code') != '00000':
-        print(f"⚠️ Failed to set margin mode: {result}")
+        log(f"Failed to set margin mode: {result}", "WARNING")
 
 def get_current_price(symbol, retries=2):
     for attempt in range(retries):
@@ -393,7 +512,7 @@ def place_order(symbol, side, size):
     endpoint="/api/mix/v1/order/placeOrder"
     params={'symbol':symbol,'marginCoin':'USDT','side':side,'orderType':'market','size':str(size)}
     result=bitget_request("POST",endpoint,params)
-    print(f"📤 Order: {side} {size} -> {result}")
+    log(f"📤 Order: {side} {size} -> {result}")
     return result
 
 def get_positions(symbol):
@@ -406,7 +525,7 @@ def close_all_positions(symbol):
             if float(p.get('total',0))>0:
                 side='close_long' if p['holdSide']=='long' else 'close_short'
                 place_order(symbol,side,float(p['total']))
-                print(f"✅ Closed {p['holdSide']} {p['total']}")
+                log(f"✅ Closed {p['holdSide']} {p['total']}")
 
 # =====================
 # WEBHOOK
@@ -468,10 +587,10 @@ def webhook():
                 return jsonify({'success':True,'action':'ignored','reason':'already_in_position'})
             
             # Opposite direction - close first
-            print(f"🔄 Closing {current_side} to open {action}")
-            virtual_balance.close_position(price)
+            log(f"🔄 Closing {current_side} to open {action}")
             close_all_positions(SYMBOL)
             time.sleep(0.5)
+            virtual_balance.close_position(price, reason="signal_flip")
 
     # Set margin/leverage
     set_margin_mode(SYMBOL,MARGIN_MODE)
@@ -496,8 +615,9 @@ def webhook():
             
     elif action=='CLOSE':
         if virtual_balance.current_position:
-            virtual_balance.close_position(price)
             close_all_positions(SYMBOL)
+            time.sleep(0.5)
+            virtual_balance.close_position(price, reason="manual_close")
         else:
             return jsonify({'success':True,'action':'no_position_to_close'})
     else:
@@ -517,8 +637,13 @@ def webhook():
 # MAIN
 # =====================
 if __name__=="__main__":
-    print("🚀 Bitget Micro-Scalper - MATCHES PINE SCRIPT")
-    print(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
-    print(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Starting: ${STARTING_BALANCE}")
+    log("🚀 Bitget Micro-Scalper - ENHANCED RECOVERY")
+    log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
+    log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Starting: ${STARTING_BALANCE}")
+    
     load_state()
+    
+    # Start position sync thread
+    virtual_balance.start_sync_thread()
+    
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
