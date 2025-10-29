@@ -16,19 +16,26 @@ BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 SYMBOL = os.environ.get('SYMBOL', 'TAOUSDT_UMCBL')
-LEVERAGE = int(os.environ.get('LEVERAGE', 30))
+LEVERAGE = int(os.environ.get('LEVERAGE', 25))
 MARGIN_MODE = 'cross'
-RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 20.0))
-STARTING_BALANCE = float(os.environ.get('STARTING_BALANCE', 20.0))
+RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 15.0))
+INITIAL_BALANCE = float(os.environ.get('INITIAL_BALANCE', 20.0))
 STATE_FILE = os.environ.get('STATE_FILE', 'vb_state.json')
 DEBOUNCE_SEC = float(os.environ.get('DEBOUNCE_SEC', 2.0))
 PRICE_CHECK_INTERVAL = 1.0
 MAX_PRICE_FAILURES = 5
-POSITION_SYNC_INTERVAL = 30.0  # Sync with Bitget every 30 seconds
+POSITION_SYNC_INTERVAL = 30.0
 
-# TP/SL CONFIG - MATCHES PINE SCRIPT
+# TP/SL CONFIG
 TAKE_PROFIT_PCT = float(os.environ.get('TAKE_PROFIT_PCT', 1.3))
 STOP_LOSS_PCT = float(os.environ.get('STOP_LOSS_PCT', 0.75))
+
+# AUTO-RESET CONFIG
+PHASE_1_THRESHOLD = float(os.environ.get('PHASE_1_THRESHOLD', 2000.0))
+PHASE_1_REINVEST = 1.0      # 100% reinvest in growth phase
+PHASE_2_REINVEST = 0.05     # 5% reinvest in extraction phase (95% withdraw)
+PROFIT_RESET_THRESHOLD = 2.0  # Reset at 200% profit (3x capital)
+MAX_DRAWDOWN_STOP = float(os.environ.get('MAX_DRAWDOWN_STOP', 50.0))
 
 LIVE_MODE = True
 BASE_URL = "https://api.bitget.com"
@@ -42,12 +49,13 @@ def log(message, level="INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 # =====================
-# VIRTUAL BALANCE WITH ENHANCED MONITORING
+# VIRTUAL BALANCE WITH AUTO-RESET & EMERGENCY STOP
 # =====================
 class VirtualBalance:
-    def __init__(self, starting_balance):
-        self.starting_balance = starting_balance
-        self.current_balance = starting_balance
+    def __init__(self, initial_balance):
+        self.initial_balance = initial_balance
+        self.starting_balance = initial_balance
+        self.current_balance = initial_balance
         self.total_trades = 0
         self.winning_trades = 0
         self.losing_trades = 0
@@ -60,12 +68,87 @@ class VirtualBalance:
         self.stop_syncing = threading.Event()
         self.position_lock = threading.Lock()
         self.max_drawdown = 0.0
-        self.peak_balance = starting_balance
+        self.peak_balance = initial_balance
         self.consecutive_losses = 0
         self.recent_pnls = deque(maxlen=10)
         self.daily_trade_count = 0
         self.last_trade_date = None
         self.last_sync_time = 0
+        
+        # Auto-reset tracking
+        self.reset_count = 0
+        self.phase_1_resets = 0
+        self.phase_2_resets = 0
+        self.total_withdrawn = 0.0
+        self.total_profit_generated = 0.0
+        self.trading_paused = False
+
+    def get_current_phase(self):
+        return "growth" if self.starting_balance < PHASE_1_THRESHOLD else "extraction"
+
+    def check_auto_reset(self):
+        """Check if we should trigger auto-reset at 200% profit"""
+        if self.current_balance >= self.starting_balance * (1 + PROFIT_RESET_THRESHOLD):
+            profit = self.current_balance - self.starting_balance
+            phase = self.get_current_phase()
+            
+            if phase == "growth":
+                # PHASE 1: Reinvest 100%
+                reinvest_pct = PHASE_1_REINVEST
+                withdraw_amount = profit * (1 - reinvest_pct)
+                log(f"🚀 PHASE 1 RESET: Growth Mode - Reinvesting 100%", "INFO")
+                self.phase_1_resets += 1
+            else:
+                # PHASE 2: Withdraw 95%, Reinvest 5%
+                reinvest_pct = PHASE_2_REINVEST
+                withdraw_amount = profit * (1 - reinvest_pct)
+                log(f"💰 PHASE 2 RESET: Extraction Mode - Withdrawing 95%!", "INFO")
+                self.phase_2_resets += 1
+            
+            new_starting = self.starting_balance + (profit * reinvest_pct)
+            
+            log(f"🎉 200% PROFIT RESET TRIGGERED!")
+            log(f"📊 Profit This Cycle: ${profit:.2f}")
+            log(f"💸 Withdraw: ${withdraw_amount:.2f}")
+            log(f"📈 New Starting Capital: ${new_starting:.2f}")
+            log(f"🔄 Total Resets: {self.reset_count + 1} (P1: {self.phase_1_resets}, P2: {self.phase_2_resets})")
+            
+            # Update state
+            self.starting_balance = new_starting
+            self.current_balance = new_starting
+            self.peak_balance = new_starting
+            self.max_drawdown = 0.0
+            self.total_withdrawn += withdraw_amount
+            self.total_profit_generated += profit
+            self.reset_count += 1
+            
+            save_state()
+            return True
+        return False
+
+    def check_emergency_stop(self):
+        """Check if drawdown exceeded emergency threshold"""
+        if self.max_drawdown >= MAX_DRAWDOWN_STOP and not self.trading_paused:
+            log(f"🚨 EMERGENCY STOP TRIGGERED!", "ERROR")
+            log(f"📉 Drawdown: {self.max_drawdown:.2f}% (Limit: {MAX_DRAWDOWN_STOP}%)")
+            log(f"💰 Current Balance: ${self.current_balance:.2f}")
+            log(f"📊 Peak Balance: ${self.peak_balance:.2f}")
+            log(f"🛑 Trading PAUSED - Manual review required")
+            
+            self.trading_paused = True
+            
+            # Close any open positions
+            if self.current_position:
+                log("🚨 Closing open position due to emergency stop")
+                close_all_positions(SYMBOL)
+                time.sleep(1)
+                current_price = get_current_price(SYMBOL)
+                if current_price:
+                    self.close_position(current_price, reason="emergency_stop")
+            
+            save_state()
+            return True
+        return False
 
     def start_sync_thread(self):
         """Start background thread to sync with Bitget positions"""
@@ -117,7 +200,6 @@ class VirtualBalance:
                         log(f"⚠️ SYNC: Bitget has {bitget_side} position but bot doesn't - recovering", "WARNING")
                         current_price = get_current_price(SYMBOL)
                         if current_price:
-                            # Create position record and start monitoring
                             self.current_position = {
                                 'side': bitget_side,
                                 'entry_price': current_price,
@@ -135,7 +217,6 @@ class VirtualBalance:
                     elif self.current_position and has_bitget_position:
                         if self.current_position['side'] != bitget_side:
                             log(f"⚠️ SYNC: Side mismatch! Bot: {self.current_position['side']}, Bitget: {bitget_side}", "ERROR")
-                            # Trust Bitget and update our record
                             current_price = get_current_price(SYMBOL)
                             if current_price:
                                 self.close_position(current_price, reason="side_mismatch")
@@ -176,7 +257,6 @@ class VirtualBalance:
             save_state()
             log(f"📝 Opened {side} {qty} @ {entry_price} | TP: {tp_price:.2f}, SL: {sl_price:.2f}")
             
-            # Start monitoring thread
             self._start_monitoring()
             return True
 
@@ -234,7 +314,7 @@ class VirtualBalance:
                             reason = "TP" if hit_tp else "SL"
                             log(f"⚡ {reason} hit for {side} at {current_price}")
                             close_all_positions(SYMBOL)
-                            time.sleep(1)  # Wait for close to process
+                            time.sleep(1)
                             self.close_position(current_price, reason=reason)
                             break
                     
@@ -267,7 +347,7 @@ class VirtualBalance:
             entry_price = self.current_position['entry_price']
             qty = self.current_position['qty']
             
-            # Calculate P&L (matches Pine Script calculation)
+            # Calculate P&L
             price_change = (exit_price - entry_price)/entry_price if side=='long' else (entry_price - exit_price)/entry_price
             pnl = qty * entry_price * price_change
             
@@ -318,18 +398,24 @@ class VirtualBalance:
             if self.consecutive_losses >= 3:
                 log(f"WARNING: {self.consecutive_losses} consecutive losses!", "WARNING")
             
+            # Check for auto-reset after closing position
+            self.check_auto_reset()
+            
+            # Check for emergency stop
+            self.check_emergency_stop()
+            
             return pnl
 
     def should_trade(self):
+        # Emergency stop override
+        if self.trading_paused:
+            log(f"Trading paused due to emergency stop", "WARNING")
+            return False
+        
         # Daily drawdown circuit breaker
         daily_drawdown = self._calculate_daily_drawdown()
         if daily_drawdown > 20.0:
             log(f"DAILY CIRCUIT BREAKER: {daily_drawdown:.2f}% loss today", "WARNING")
-            return False
-        
-        # Max drawdown
-        if self.max_drawdown > 40:
-            log(f"Max drawdown {self.max_drawdown:.2f}% exceeded", "WARNING")
             return False
         
         # Consecutive losses
@@ -338,7 +424,7 @@ class VirtualBalance:
             return False
         
         # Balance check
-        if self.current_balance < self.starting_balance * 0.3:
+        if self.current_balance < self.initial_balance * 0.3:
             log(f"Balance too low: {self.current_balance:.2f}", "WARNING")
             return False
         
@@ -369,7 +455,12 @@ class VirtualBalance:
         avg_win = sum(p for p in self.recent_pnls if p > 0) / max(sum(1 for p in self.recent_pnls if p > 0), 1)
         avg_loss = sum(p for p in self.recent_pnls if p < 0) / max(sum(1 for p in self.recent_pnls if p < 0), 1)
         
+        next_reset_at = self.starting_balance * (1 + PROFIT_RESET_THRESHOLD)
+        
         return {
+            'status': 'emergency_stopped' if self.trading_paused else 'live',
+            'current_phase': self.get_current_phase(),
+            'initial_balance': self.initial_balance,
             'starting_balance': self.starting_balance,
             'current_balance': self.current_balance,
             'total_pnl': self.total_pnl,
@@ -388,10 +479,20 @@ class VirtualBalance:
             'can_trade': self.should_trade(),
             'last_sync': datetime.fromtimestamp(self.last_sync_time).isoformat() if self.last_sync_time > 0 else 'never',
             'monitor_alive': self.monitor_thread.is_alive() if self.monitor_thread else False,
-            'sync_alive': self.sync_thread.is_alive() if self.sync_thread else False
+            'sync_alive': self.sync_thread.is_alive() if self.sync_thread else False,
+            
+            # Auto-reset stats
+            'reset_count': self.reset_count,
+            'phase_1_resets': self.phase_1_resets,
+            'phase_2_resets': self.phase_2_resets,
+            'total_withdrawn': self.total_withdrawn,
+            'total_profit_generated': self.total_profit_generated,
+            'next_reset_at': next_reset_at,
+            'phase_1_threshold': PHASE_1_THRESHOLD,
+            'emergency_stop_threshold': MAX_DRAWDOWN_STOP
         }
 
-virtual_balance = VirtualBalance(STARTING_BALANCE)
+virtual_balance = VirtualBalance(INITIAL_BALANCE)
 
 # =====================
 # STATE
@@ -399,6 +500,7 @@ virtual_balance = VirtualBalance(STARTING_BALANCE)
 def save_state():
     try:
         state = {
+            'initial_balance': virtual_balance.initial_balance,
             'starting_balance': virtual_balance.starting_balance,
             'current_balance': virtual_balance.current_balance,
             'total_trades': virtual_balance.total_trades,
@@ -409,7 +511,13 @@ def save_state():
             'current_position': virtual_balance.current_position,
             'max_drawdown': virtual_balance.max_drawdown,
             'peak_balance': virtual_balance.peak_balance,
-            'consecutive_losses': virtual_balance.consecutive_losses
+            'consecutive_losses': virtual_balance.consecutive_losses,
+            'reset_count': virtual_balance.reset_count,
+            'phase_1_resets': virtual_balance.phase_1_resets,
+            'phase_2_resets': virtual_balance.phase_2_resets,
+            'total_withdrawn': virtual_balance.total_withdrawn,
+            'total_profit_generated': virtual_balance.total_profit_generated,
+            'trading_paused': virtual_balance.trading_paused
         }
         with open(STATE_FILE,'w') as f:
             json.dump(state, f, indent=2)
@@ -421,8 +529,9 @@ def load_state():
     try:
         with open(STATE_FILE,'r') as f:
             st=json.load(f)
-        vb=VirtualBalance(st.get('starting_balance', STARTING_BALANCE))
-        vb.current_balance = st.get('current_balance', STARTING_BALANCE)
+        vb=VirtualBalance(st.get('initial_balance', INITIAL_BALANCE))
+        vb.starting_balance = st.get('starting_balance', INITIAL_BALANCE)
+        vb.current_balance = st.get('current_balance', INITIAL_BALANCE)
         vb.total_trades = st.get('total_trades',0)
         vb.winning_trades = st.get('winning_trades',0)
         vb.losing_trades = st.get('losing_trades',0)
@@ -430,12 +539,18 @@ def load_state():
         vb.trade_history = st.get('trade_history',[])
         vb.current_position = st.get('current_position',None)
         vb.max_drawdown = st.get('max_drawdown', 0.0)
-        vb.peak_balance = st.get('peak_balance', STARTING_BALANCE)
+        vb.peak_balance = st.get('peak_balance', INITIAL_BALANCE)
         vb.consecutive_losses = st.get('consecutive_losses', 0)
+        vb.reset_count = st.get('reset_count', 0)
+        vb.phase_1_resets = st.get('phase_1_resets', 0)
+        vb.phase_2_resets = st.get('phase_2_resets', 0)
+        vb.total_withdrawn = st.get('total_withdrawn', 0.0)
+        vb.total_profit_generated = st.get('total_profit_generated', 0.0)
+        vb.trading_paused = st.get('trading_paused', False)
         virtual_balance = vb
         log("✅ Loaded virtual balance")
         
-        # Start sync thread first
+        # Start sync thread
         vb.start_sync_thread()
         
         # Restart monitoring if position exists
@@ -489,12 +604,6 @@ def set_leverage(symbol, leverage):
         if result.get('code') != '00000':
             log(f"Failed to set {side} leverage: {result}", "WARNING")
 
-def set_margin_mode(symbol, margin_mode):
-    result = bitget_request("POST","/api/mix/v1/account/setMarginMode",
-                           {'symbol':symbol,'marginCoin':'USDT','marginMode':margin_mode})
-    if result.get('code') != '00000':
-        log(f"Failed to set margin mode: {result}", "WARNING")
-
 def get_current_price(symbol, retries=2):
     for attempt in range(retries):
         try:
@@ -507,11 +616,6 @@ def get_current_price(symbol, retries=2):
     return None
 
 def calculate_position_size(balance, price, leverage, risk_pct):
-    """
-    Matches Pine Script calculation:
-    positionValue = currentEquity * (riskPerTrade / 100.0) * leverage
-    qty = positionValue / close
-    """
     position_value = balance * (risk_pct / 100.0) * leverage
     qty = round(position_value / price, 3)
     return max(qty, 0.001)
@@ -544,13 +648,15 @@ def webhook():
     
     if request.method=='GET':
         return jsonify({
-            "status":"live",
             "virtual_balance":virtual_balance.get_stats(),
             "config": {
                 "leverage": LEVERAGE,
                 "risk_pct": RISK_PERCENTAGE,
                 "tp_pct": TAKE_PROFIT_PCT,
-                "sl_pct": STOP_LOSS_PCT
+                "sl_pct": STOP_LOSS_PCT,
+                "phase_1_threshold": PHASE_1_THRESHOLD,
+                "phase_2_withdraw_pct": 95.0,
+                "emergency_stop_dd": MAX_DRAWDOWN_STOP
             },
             "uptime": datetime.now().isoformat()
         }),200
@@ -575,7 +681,7 @@ def webhook():
         return jsonify({
             'success': False,
             'action': 'blocked',
-            'reason': 'risk_limits_exceeded',
+            'reason': 'risk_limits_exceeded' if not virtual_balance.trading_paused else 'emergency_stopped',
             'stats': virtual_balance.get_stats()
         })
 
@@ -600,7 +706,7 @@ def webhook():
             time.sleep(0.5)
             virtual_balance.close_position(price, reason="signal_flip")
 
-    # Set leverage only (skip margin mode - might already be set)
+    # Set leverage only
     set_leverage(SYMBOL,LEVERAGE)
 
     # Execute new position
@@ -640,13 +746,43 @@ def webhook():
         'timestamp':datetime.now().isoformat()
     })
 
+@app.route('/resume',methods=['POST'])
+def resume_trading():
+    """Resume trading after emergency stop"""
+    try:
+        data = request.json
+        if data.get('secret') != WEBHOOK_SECRET:
+            return jsonify({'error':'Unauthorized'}),401
+        
+        if virtual_balance.trading_paused:
+            virtual_balance.trading_paused = False
+            virtual_balance.max_drawdown = 0.0  # Reset drawdown tracker
+            save_state()
+            log("✅ Trading resumed by manual override")
+            return jsonify({
+                'success': True,
+                'message': 'Trading resumed',
+                'stats': virtual_balance.get_stats()
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Trading was not paused'
+            })
+    except Exception as e:
+        log(f"Resume error: {e}", "ERROR")
+        return jsonify({'error': str(e)}), 500
+
 # =====================
 # MAIN
 # =====================
 if __name__=="__main__":
-    log("🚀 Bitget Micro-Scalper - ENHANCED RECOVERY")
+    log("🚀 Bitget Auto-Reset Bot - PHASE 1 & 2")
     log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
-    log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Starting: ${STARTING_BALANCE}")
+    log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%")
+    log(f"💰 Phase 1 Threshold: ${PHASE_1_THRESHOLD} (100% reinvest)")
+    log(f"💸 Phase 2: 95% withdraw, 5% reinvest")
+    log(f"🛑 Emergency Stop: {MAX_DRAWDOWN_STOP}% drawdown")
     
     # Load state and start threads
     load_state()
