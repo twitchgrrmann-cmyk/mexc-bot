@@ -430,6 +430,9 @@ def load_state():
         virtual_balance = vb
         log("✅ Loaded virtual balance")
         
+        # Start sync thread first
+        vb.start_sync_thread()
+        
         # Restart monitoring if position exists
         if vb.current_position:
             log("🔄 Restarting position monitor after reload")
@@ -643,7 +646,9 @@ if __name__=="__main__":
     
     load_state()
     
-    # Start position sync thread
-    virtual_balance.start_sync_thread()
+    # Ensure sync thread is running (redundant check)
+    if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
+        log("⚠️ Sync thread not running, starting now", "WARNING")
+        virtual_balance.start_sync_thread()
     
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
