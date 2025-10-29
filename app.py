@@ -774,30 +774,36 @@ def resume_trading():
         return jsonify({'error': str(e)}), 500
 
 # =====================
+# INITIALIZATION (Runs when Gunicorn loads the app)
+# =====================
+log("🚀 Bitget Auto-Reset Bot - PHASE 1 & 2")
+log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
+log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%")
+log(f"💰 Phase 1 Threshold: ${PHASE_1_THRESHOLD} (100% reinvest)")
+log(f"💸 Phase 2: 95% withdraw, 5% reinvest")
+log(f"🛑 Emergency Stop: {MAX_DRAWDOWN_STOP}% drawdown")
+
+# Load state and start threads
+load_state()
+
+# Force start sync thread with retry
+max_retries = 3
+for attempt in range(max_retries):
+    if virtual_balance.sync_thread and virtual_balance.sync_thread.is_alive():
+        log("✅ Sync thread confirmed running")
+        break
+    log(f"Attempting to start sync thread (attempt {attempt + 1}/{max_retries})", "WARNING")
+    virtual_balance.start_sync_thread()
+    time.sleep(1)
+
+if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
+    log("❌ CRITICAL: Sync thread failed to start!", "ERROR")
+else:
+    log("✅ Bot initialization complete - Ready to trade!")
+
+# =====================
 # MAIN
 # =====================
 if __name__=="__main__":
-    log("🚀 Bitget Auto-Reset Bot - PHASE 1 & 2")
-    log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
-    log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%")
-    log(f"💰 Phase 1 Threshold: ${PHASE_1_THRESHOLD} (100% reinvest)")
-    log(f"💸 Phase 2: 95% withdraw, 5% reinvest")
-    log(f"🛑 Emergency Stop: {MAX_DRAWDOWN_STOP}% drawdown")
-    
-    # Load state and start threads
-    load_state()
-    
-    # Force start sync thread with retry
-    max_retries = 3
-    for attempt in range(max_retries):
-        if virtual_balance.sync_thread and virtual_balance.sync_thread.is_alive():
-            log("✅ Sync thread confirmed running")
-            break
-        log(f"Attempting to start sync thread (attempt {attempt + 1}/{max_retries})", "WARNING")
-        virtual_balance.start_sync_thread()
-        time.sleep(1)
-    
-    if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
-        log("❌ CRITICAL: Sync thread failed to start!", "ERROR")
-    
+    # This only runs if executed directly (not with Gunicorn)
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
