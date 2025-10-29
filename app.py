@@ -69,11 +69,16 @@ class VirtualBalance:
 
     def start_sync_thread(self):
         """Start background thread to sync with Bitget positions"""
-        if self.sync_thread is None or not self.sync_thread.is_alive():
-            self.stop_syncing.clear()
-            self.sync_thread = threading.Thread(target=self.sync_with_bitget, daemon=True)
-            self.sync_thread.start()
-            log("Started position sync thread")
+        try:
+            if self.sync_thread is None or not self.sync_thread.is_alive():
+                self.stop_syncing.clear()
+                self.sync_thread = threading.Thread(target=self.sync_with_bitget, daemon=True)
+                self.sync_thread.start()
+                log("✅ Started position sync thread")
+            else:
+                log("Sync thread already running")
+        except Exception as e:
+            log(f"Failed to start sync thread: {e}", "ERROR")
 
     def sync_with_bitget(self):
         """Periodically check Bitget for position mismatches"""
@@ -595,8 +600,7 @@ def webhook():
             time.sleep(0.5)
             virtual_balance.close_position(price, reason="signal_flip")
 
-    # Set margin/leverage
-    set_margin_mode(SYMBOL,MARGIN_MODE)
+    # Set leverage only (skip margin mode - might already be set)
     set_leverage(SYMBOL,LEVERAGE)
 
     # Execute new position
@@ -644,11 +648,20 @@ if __name__=="__main__":
     log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
     log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Starting: ${STARTING_BALANCE}")
     
+    # Load state and start threads
     load_state()
     
-    # Ensure sync thread is running (redundant check)
-    if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
-        log("⚠️ Sync thread not running, starting now", "WARNING")
+    # Force start sync thread with retry
+    max_retries = 3
+    for attempt in range(max_retries):
+        if virtual_balance.sync_thread and virtual_balance.sync_thread.is_alive():
+            log("✅ Sync thread confirmed running")
+            break
+        log(f"Attempting to start sync thread (attempt {attempt + 1}/{max_retries})", "WARNING")
         virtual_balance.start_sync_thread()
+        time.sleep(1)
+    
+    if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
+        log("❌ CRITICAL: Sync thread failed to start!", "ERROR")
     
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
