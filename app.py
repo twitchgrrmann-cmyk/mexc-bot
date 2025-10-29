@@ -7,7 +7,7 @@ from collections import deque
 app = Flask(__name__)
 
 # =====================
-# CONFIG - MATCH YOUR WINNING PINE SCRIPT SETTINGS
+# CONFIG - MATCHES PINE SCRIPT
 # =====================
 BITGET_API_KEY = os.environ.get('BITGET_API_KEY', '')
 BITGET_SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', '')
@@ -15,26 +15,25 @@ BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'Grrtrades')
 
 SYMBOL = os.environ.get('SYMBOL', 'TAOUSDT_UMCBL')
-LEVERAGE = int(os.environ.get('LEVERAGE', 25))  # Changed from 15 to 25
+LEVERAGE = int(os.environ.get('LEVERAGE', 100))
 MARGIN_MODE = 'cross'
-RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 40.0))  # Changed from 50 to 40
-STARTING_BALANCE = float(os.environ.get('STARTING_BALANCE', 20.0))  # Changed from 15 to 20
-MAX_POSITION_USD = float(os.environ.get('MAX_POSITION_USD', 300.0))  # NEW: Position cap
+RISK_PERCENTAGE = float(os.environ.get('RISK_PERCENTAGE', 20.0))
+STARTING_BALANCE = float(os.environ.get('STARTING_BALANCE', 20.0))
 STATE_FILE = os.environ.get('STATE_FILE', 'vb_state.json')
 DEBOUNCE_SEC = float(os.environ.get('DEBOUNCE_SEC', 2.0))
 PRICE_CHECK_INTERVAL = 1.0
 MAX_PRICE_FAILURES = 5
 
-# TP/SL CONFIG - MATCH YOUR WINNING SETTINGS
-TAKE_PROFIT_PCT = float(os.environ.get('TAKE_PROFIT_PCT', 1.2))  # Changed from 0.8 to 1.2
-STOP_LOSS_PCT = float(os.environ.get('STOP_LOSS_PCT', 0.7))  # Changed from 0.9 to 0.7
+# TP/SL CONFIG - MATCHES PINE SCRIPT
+TAKE_PROFIT_PCT = float(os.environ.get('TAKE_PROFIT_PCT', 1.3))
+STOP_LOSS_PCT = float(os.environ.get('STOP_LOSS_PCT', 0.75))
 
 LIVE_MODE = True
 BASE_URL = "https://api.bitget.com"
 last_signal_time = 0
 
 # =====================
-# VIRTUAL BALANCE WITH RISK MANAGEMENT
+# VIRTUAL BALANCE
 # =====================
 class VirtualBalance:
     def __init__(self, starting_balance):
@@ -146,9 +145,9 @@ class VirtualBalance:
             entry_price = self.current_position['entry_price']
             qty = self.current_position['qty']
             
-            # Calculate P&L
+            # Calculate P&L (matches Pine Script calculation)
             price_change = (exit_price - entry_price)/entry_price if side=='long' else (entry_price - exit_price)/entry_price
-            pnl = qty * entry_price * price_change * LEVERAGE
+            pnl = qty * entry_price * price_change
             
             # Update balance and stats
             self.current_balance += pnl
@@ -201,12 +200,12 @@ class VirtualBalance:
     def should_trade(self):
         # Daily drawdown circuit breaker
         daily_drawdown = self._calculate_daily_drawdown()
-        if daily_drawdown > 15.0:
+        if daily_drawdown > 20.0:
             print(f"🚨 DAILY CIRCUIT BREAKER: {daily_drawdown:.2f}% loss today")
             return False
         
         # Max drawdown
-        if self.max_drawdown > 30:
+        if self.max_drawdown > 40:
             print(f"🛑 Max drawdown {self.max_drawdown:.2f}% exceeded")
             return False
         
@@ -216,7 +215,7 @@ class VirtualBalance:
             return False
         
         # Balance check
-        if self.current_balance < self.starting_balance * 0.5:
+        if self.current_balance < self.starting_balance * 0.3:
             print(f"🛑 Balance too low: {self.current_balance:.2f}")
             return False
         
@@ -380,16 +379,14 @@ def get_current_price(symbol, retries=2):
                 time.sleep(0.5)
     return None
 
-def calculate_position_size(balance, price, leverage, risk_pct, max_position_usd=MAX_POSITION_USD):
-    # Base calculation
-    usable_balance = balance * (risk_pct / 100.0)
-    base_position_value = usable_balance * leverage
-    
-    # Apply position cap
-    capped_position_value = min(base_position_value, max_position_usd)
-    
-    # Calculate quantity
-    qty = round(capped_position_value / price, 3)
+def calculate_position_size(balance, price, leverage, risk_pct):
+    """
+    Matches Pine Script calculation:
+    positionValue = currentEquity * (riskPerTrade / 100.0) * leverage
+    qty = positionValue / close
+    """
+    position_value = balance * (risk_pct / 100.0) * leverage
+    qty = round(position_value / price, 3)
     return max(qty, 0.001)
 
 def place_order(symbol, side, size):
@@ -422,6 +419,12 @@ def webhook():
         return jsonify({
             "status":"live",
             "virtual_balance":virtual_balance.get_stats(),
+            "config": {
+                "leverage": LEVERAGE,
+                "risk_pct": RISK_PERCENTAGE,
+                "tp_pct": TAKE_PROFIT_PCT,
+                "sl_pct": STOP_LOSS_PCT
+            },
             "uptime": datetime.now().isoformat()
         }),200
 
@@ -476,7 +479,7 @@ def webhook():
 
     # Execute new position
     if action in ['BUY','LONG']:
-        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE, MAX_POSITION_USD)
+        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE)
         result = place_order(SYMBOL,'open_long',qty)
         if result.get('code') == '00000':
             virtual_balance.open_position('long',price,qty)
@@ -484,7 +487,7 @@ def webhook():
             return jsonify({'error':'Order failed','details':result}),500
             
     elif action in ['SELL','SHORT']:
-        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE, MAX_POSITION_USD)
+        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE)
         result = place_order(SYMBOL,'open_short',qty)
         if result.get('code') == '00000':
             virtual_balance.open_position('short',price,qty)
@@ -504,6 +507,8 @@ def webhook():
         'success':True,
         'action':action,
         'price':price,
+        'qty': qty if action in ['BUY','LONG','SELL','SHORT'] else None,
+        'position_value': qty * price if action in ['BUY','LONG','SELL','SHORT'] else None,
         'virtual_balance':virtual_balance.get_stats(),
         'timestamp':datetime.now().isoformat()
     })
@@ -512,8 +517,8 @@ def webhook():
 # MAIN
 # =====================
 if __name__=="__main__":
-    print("🚀 Bitget Micro-Scalper - OPTIMIZED")
+    print("🚀 Bitget Micro-Scalper - MATCHES PINE SCRIPT")
     print(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
-    print(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Max Position: ${MAX_POSITION_USD}")
+    print(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}% | Starting: ${STARTING_BALANCE}")
     load_state()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
