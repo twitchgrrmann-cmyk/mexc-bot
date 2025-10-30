@@ -242,40 +242,66 @@ load_state()
 # ===================================================
 last_signal_time = 0
 
-
-@app.route("/webhook", methods=["POST", "GET"])
+@app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
     global last_signal_time
-    if request.method == "GET":
-        return jsonify(
-            {"virtual_balance": virtual_balance.__dict__, "uptime": datetime.now().isoformat()}
-        )
 
-    data = json.loads(request.get_data(as_text=True))
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+    # --- Handle GET (status check) ---
+    if request.method == 'GET':
+        return jsonify({
+            'status': 'webhook online',
+            'can_trade': virtual_balance.should_trade(),
+            'balance': virtual_balance.current_balance,
+            'position': virtual_balance.current_position,
+            'uptime': datetime.now().isoformat()
+        }), 200
 
+    # --- Handle POST (TradingView signals) ---
+    try:
+        data = json.loads(request.get_data(as_text=True))
+    except Exception:
+        return jsonify({'error': 'Invalid JSON'}), 400
+
+    # Check secret
+    if data.get('secret') != WEBHOOK_SECRET:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Debounce signals (prevent spam)
     now = time.time()
     if now - last_signal_time < DEBOUNCE_SEC:
-        return jsonify({"success": True, "action": "debounced"})
-
+        return jsonify({'success': True, 'action': 'debounced'}), 200
     last_signal_time = now
-    if not virtual_balance.should_trade():
-        return jsonify({"success": False, "reason": "paused"})
 
-    action = data.get("action", "").upper()
+    # Stop trading if paused
+    if not virtual_balance.should_trade():
+        return jsonify({'success': False, 'reason': 'paused'}), 200
+
+    # Get action
+    action = data.get('action', '').upper()
+    if action not in ['BUY', 'LONG', 'SELL', 'SHORT']:
+        return jsonify({'error': 'Invalid action'}), 400
+
+    # Get live price
     price = get_current_price(SYMBOL)
     if not price:
-        return jsonify({"error": "Price fetch failed"}), 500
+        return jsonify({'error': 'Price fetch failed'}), 500
 
+    # Open or flip position
     with virtual_balance.position_lock:
         if virtual_balance.current_position:
-            virtual_balance.close_position(price, "signal_flip")
+            virtual_balance.close_position(price, 'signal_flip')
+
         qty = virtual_balance.current_balance * (RISK_PERCENTAGE / 100) * LEVERAGE / price
-        virtual_balance.open_position(
-            "long" if action in ["BUY", "LONG"] else "short", price, qty
-        )
-    return jsonify({"success": True, "action": action, "virtual_balance": virtual_balance.__dict__})
+        side = 'long' if action in ['BUY', 'LONG'] else 'short'
+        virtual_balance.open_position(side, price, qty)
+
+    return jsonify({
+        'success': True,
+        'action': action,
+        'price': price,
+        'balance': virtual_balance.current_balance,
+        'position': virtual_balance.current_position
+    }), 200
 
 
 # ===================================================
