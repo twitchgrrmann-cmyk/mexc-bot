@@ -640,180 +640,37 @@ def close_all_positions(symbol):
                 log(f"✅ Closed {p['holdSide']} {p['total']}")
 
 # =====================
-# WEBHOOK
+# HEALTH ENDPOINT (FIXES YOUR 404 ISSUE!)
 # =====================
-@app.route('/webhook',methods=['POST','GET'])
-def webhook():
-    global last_signal_time
-    
-    if request.method=='GET':
-        # Check and restart dead threads
-        if virtual_balance.sync_thread is None or not virtual_balance.sync_thread.is_alive():
-            log("⚠️ Sync thread died, restarting...", "WARNING")
+@app.route('/health', methods=['GET', 'HEAD'])
+def health():
+    """Health check for Render and uptime monitors"""
+    try:
+        # Check critical threads
+        sync_alive = virtual_balance.sync_thread and virtual_balance.sync_thread.is_alive()
+        monitor_alive = virtual_balance.monitor_thread and virtual_balance.monitor_thread.is_alive() if virtual_balance.current_position else True
+        
+        # Restart sync thread if dead
+        if not sync_alive:
+            log("⚠️ Health check: Sync thread dead, restarting...", "WARNING")
             virtual_balance.start_sync_thread()
         
         # Restart monitor if position exists but monitor is dead
-        if virtual_balance.current_position and (virtual_balance.monitor_thread is None or not virtual_balance.monitor_thread.is_alive()):
-            log("⚠️ Monitor thread died, restarting...", "WARNING")
+        if virtual_balance.current_position and not monitor_alive:
+            log("⚠️ Health check: Monitor thread dead, restarting...", "WARNING")
             virtual_balance._start_monitoring()
         
-        return jsonify({
-            "virtual_balance":virtual_balance.get_stats(),
-            "config": {
-                "leverage": LEVERAGE,
-                "risk_pct": RISK_PERCENTAGE,
-                "tp_pct": TAKE_PROFIT_PCT,
-                "sl_pct": STOP_LOSS_PCT,
-                "phase_1_threshold": PHASE_1_THRESHOLD,
-                "phase_2_withdraw_pct": 95.0,
-                "emergency_stop_dd": MAX_DRAWDOWN_STOP
-            },
-            "uptime": datetime.now().isoformat()
-        }),200
-
-    raw_data=request.get_data(as_text=True)
-    try:
-        data=json.loads(raw_data)
-    except:
-        return jsonify({'error':'Invalid JSON'}),400
-    
-    if data.get('secret')!=WEBHOOK_SECRET:
-        return jsonify({'error':'Unauthorized'}),401
-
-    # Debounce
-    now=time.time()
-    if now-last_signal_time<DEBOUNCE_SEC:
-        return jsonify({'success':True,'action':'debounced'})
-    last_signal_time=now
-
-    # Risk management check
-    if not virtual_balance.should_trade():
-        return jsonify({
-            'success': False,
-            'action': 'blocked',
-            'reason': 'risk_limits_exceeded' if not virtual_balance.trading_paused else 'emergency_stopped',
-            'stats': virtual_balance.get_stats()
-        })
-
-    action=data.get('action','').upper()
-    price=get_current_price(SYMBOL)
-    if not price:
-        return jsonify({'error':'Price fetch failed'}),500
-
-    # Handle existing position
-    with virtual_balance.position_lock:
-        if virtual_balance.current_position:
-            current_side = virtual_balance.current_position['side']
-            
-            # Same direction - ignore
-            if (action in ['BUY','LONG'] and current_side=='long') or \
-               (action in ['SELL','SHORT'] and current_side=='short'):
-                return jsonify({'success':True,'action':'ignored','reason':'already_in_position'})
-            
-            # Opposite direction - close first
-            log(f"🔄 Closing {current_side} to open {action}")
-            close_all_positions(SYMBOL)
-            time.sleep(0.5)
-            virtual_balance.close_position(price, reason="signal_flip")
-
-    # Set leverage only
-    set_leverage(SYMBOL,LEVERAGE)
-
-    # Execute new position
-    if action in ['BUY','LONG']:
-        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE)
-        result = place_order(SYMBOL,'open_long',qty)
-        if result.get('code') == '00000':
-            virtual_balance.open_position('long',price,qty)
-        else:
-            return jsonify({'error':'Order failed','details':result}),500
-            
-    elif action in ['SELL','SHORT']:
-        qty=calculate_position_size(virtual_balance.current_balance, price, LEVERAGE, RISK_PERCENTAGE)
-        result = place_order(SYMBOL,'open_short',qty)
-        if result.get('code') == '00000':
-            virtual_balance.open_position('short',price,qty)
-        else:
-            return jsonify({'error':'Order failed','details':result}),500
-            
-    elif action=='CLOSE':
-        if virtual_balance.current_position:
-            close_all_positions(SYMBOL)
-            time.sleep(0.5)
-            virtual_balance.close_position(price, reason="manual_close")
-        else:
-            return jsonify({'success':True,'action':'no_position_to_close'})
-    else:
-        return jsonify({'error':f'Invalid action: {action}'}),400
-
-    return jsonify({
-        'success':True,
-        'action':action,
-        'price':price,
-        'qty': qty if action in ['BUY','LONG','SELL','SHORT'] else None,
-        'position_value': qty * price if action in ['BUY','LONG','SELL','SHORT'] else None,
-        'virtual_balance':virtual_balance.get_stats(),
-        'timestamp':datetime.now().isoformat()
-    })
-
-@app.route('/resume',methods=['POST'])
-def resume_trading():
-    """Resume trading after emergency stop"""
-    try:
-        data = request.json
-        if data.get('secret') != WEBHOOK_SECRET:
-            return jsonify({'error':'Unauthorized'}),401
+        health_status = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'sync_thread': sync_alive,
+            'monitor_thread': monitor_alive,
+            'has_position': virtual_balance.current_position is not None,
+            'trading_paused': virtual_balance.trading_paused,
+            'balance': virtual_balance.current_balance
+        }
         
-        if virtual_balance.trading_paused:
-            virtual_balance.trading_paused = False
-            virtual_balance.max_drawdown = 0.0  # Reset drawdown tracker
-            save_state()
-            log("✅ Trading resumed by manual override")
-            return jsonify({
-                'success': True,
-                'message': 'Trading resumed',
-                'stats': virtual_balance.get_stats()
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'message': 'Trading was not paused'
-            })
+        return jsonify(health_status), 200
     except Exception as e:
-        log(f"Resume error: {e}", "ERROR")
-        return jsonify({'error': str(e)}), 500
-
-# =====================
-# INITIALIZATION (Runs when Gunicorn loads the app)
-# =====================
-log("🚀 Bitget Auto-Reset Bot - PHASE 1 & 2")
-log(f"📊 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
-log(f"🎯 TP: {TAKE_PROFIT_PCT}% | SL: {STOP_LOSS_PCT}%")
-log(f"💰 Phase 1 Threshold: ${PHASE_1_THRESHOLD} (100% reinvest)")
-log(f"💸 Phase 2: 95% withdraw, 5% reinvest")
-log(f"🛑 Emergency Stop: {MAX_DRAWDOWN_STOP}% drawdown")
-
-# Load state and start threads
-load_state()
-
-# Force start sync thread with retry
-max_retries = 3
-for attempt in range(max_retries):
-    if virtual_balance.sync_thread and virtual_balance.sync_thread.is_alive():
-        log("✅ Sync thread confirmed running")
-        break
-    log(f"Attempting to start sync thread (attempt {attempt + 1}/{max_retries})", "WARNING")
-    virtual_balance.start_sync_thread()
-    time.sleep(1)
-
-if not virtual_balance.sync_thread or not virtual_balance.sync_thread.is_alive():
-    log("❌ CRITICAL: Sync thread failed to start!", "ERROR")
-else:
-    log("✅ Bot initialization complete - Ready to trade!")
-
-# =====================
-# MAIN
-# =====================
-if __name__=="__main__":
-    # This only runs if executed directly (not with Gunicorn)
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT",5000)),debug=False)
+        log(f"Health check error: {e}", "ERROR")
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
