@@ -647,6 +647,16 @@ def webhook():
     global last_signal_time
     
     if request.method=='GET':
+        # Check and restart dead threads
+        if virtual_balance.sync_thread is None or not virtual_balance.sync_thread.is_alive():
+            log("⚠️ Sync thread died, restarting...", "WARNING")
+            virtual_balance.start_sync_thread()
+        
+        # Restart monitor if position exists but monitor is dead
+        if virtual_balance.current_position and (virtual_balance.monitor_thread is None or not virtual_balance.monitor_thread.is_alive()):
+            log("⚠️ Monitor thread died, restarting...", "WARNING")
+            virtual_balance._start_monitoring()
+        
         return jsonify({
             "virtual_balance":virtual_balance.get_stats(),
             "config": {
