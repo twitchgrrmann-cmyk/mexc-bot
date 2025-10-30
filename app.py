@@ -44,6 +44,7 @@ MAX_DRAWDOWN_STOP = float(os.environ.get("MAX_DRAWDOWN_STOP", 50.0))
 DEBOUNCE_SEC = float(os.environ.get("DEBOUNCE_SEC", 2.0))
 PRICE_CHECK_INTERVAL = 1.0
 MAX_PRICE_FAILURES = 5
+STATS_LOG_INTERVAL = 300  # Log stats every 5 minutes
 
 # ===================================================
 # ✅ LOGGING
@@ -129,7 +130,7 @@ class VirtualBalance:
             }
             self._start_monitoring()
             save_state()
-            log(f"Opened {side.upper()} position @ {entry_price} | qty: {qty}")
+            log(f"📈 Opened {side.upper()} position @ ${entry_price:.4f} | Qty: {qty:.6f} | TP: ${tp_price:.4f} | SL: ${sl_price:.4f}")
             return True
 
     def _start_monitoring(self):
@@ -185,14 +186,53 @@ class VirtualBalance:
                 self.winning_trades += 1
             else:
                 self.losing_trades += 1
+            
+            pnl_pct = (pnl / self.current_balance) * 100
+            emoji = "✅" if pnl > 0 else "❌"
+            
             self.current_position = None
             save_state()
-            log(f"Closed {side.upper()} position | PnL: {pnl:.4f} | Reason: {reason}")
+            log(f"{emoji} Closed {side.upper()} @ ${exit_price:.4f} | PnL: ${pnl:.4f} ({pnl_pct:+.2f}%) | Reason: {reason} | New Balance: ${self.current_balance:.2f}")
             self.check_auto_reset()
             self.check_emergency_stop()
 
     def should_trade(self):
         return not self.trading_paused
+
+    def log_stats(self):
+        """Log comprehensive trading statistics"""
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        roi = ((self.current_balance - self.initial_balance) / self.initial_balance) * 100
+        phase = self.get_current_phase()
+        
+        log("=" * 60)
+        log(f"📊 TRADING STATISTICS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log("=" * 60)
+        log(f"💰 Virtual Balance: ${self.current_balance:.2f} (Start: ${self.starting_balance:.2f})")
+        log(f"📈 Total PnL: ${self.total_pnl:.2f} | ROI: {roi:+.2f}%")
+        log(f"📊 Trades: {self.total_trades} | Wins: {self.winning_trades} | Losses: {self.losing_trades} | Win Rate: {win_rate:.1f}%")
+        log(f"🎯 Phase: {phase.upper()} | Resets: {self.reset_count} (P1: {self.phase_1_resets}, P2: {self.phase_2_resets})")
+        log(f"💸 Total Withdrawn: ${self.total_withdrawn:.2f} | Total Profit: ${self.total_profit_generated:.2f}")
+        
+        if self.current_position:
+            pos = self.current_position
+            current_price = get_current_price(SYMBOL)
+            if current_price:
+                unrealized_pnl = pos['qty'] * pos['entry_price'] * (
+                    (current_price - pos['entry_price']) / pos['entry_price']
+                    if pos['side'] == 'long'
+                    else (pos['entry_price'] - current_price) / pos['entry_price']
+                )
+                log(f"🔓 ACTIVE POSITION: {pos['side'].upper()} | Entry: ${pos['entry_price']:.4f} | Current: ${current_price:.4f}")
+                log(f"   Qty: {pos['qty']:.6f} | TP: ${pos['tp_price']:.4f} | SL: ${pos['sl_price']:.4f}")
+                log(f"   Unrealized PnL: ${unrealized_pnl:.4f} ({(unrealized_pnl/self.current_balance)*100:+.2f}%)")
+        else:
+            log("🔒 No active position")
+        
+        if self.trading_paused:
+            log("⚠️  TRADING PAUSED - Emergency stop triggered!")
+        
+        log("=" * 60)
 
 
 # ===================================================
@@ -201,6 +241,10 @@ class VirtualBalance:
 def save_state():
     try:
         state = virtual_balance.__dict__.copy()
+        # Remove non-serializable objects
+        state.pop('monitor_thread', None)
+        state.pop('stop_monitoring', None)
+        state.pop('position_lock', None)
         with open(STATE_FILE_PATH, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -211,10 +255,15 @@ def load_state():
     try:
         with open(STATE_FILE_PATH, "r") as f:
             st = json.load(f)
+        # Restore serializable attributes
         for k, v in st.items():
-            setattr(virtual_balance, k, v)
+            if k not in ['monitor_thread', 'stop_monitoring', 'position_lock']:
+                setattr(virtual_balance, k, v)
+        log(f"✅ State loaded from disk: Balance ${virtual_balance.current_balance:.2f}")
     except FileNotFoundError:
-        log("No previous state found — starting fresh.")
+        log("📝 No previous state found — starting fresh with ${:.2f}".format(INITIAL_BALANCE))
+    except Exception as e:
+        log(f"⚠️  Failed to load state: {e}", "WARN")
 
 
 # ===================================================
@@ -227,8 +276,21 @@ def get_current_price(symbol):
         ).json()
         return float(data["data"]["last"]) if data.get("code") == "00000" else None
     except Exception as e:
-        log(f"Price fetch failed: {e}", "ERROR")
+        log(f"❌ Price fetch failed: {e}", "ERROR")
         return None
+
+
+# ===================================================
+# ✅ PERIODIC STATS LOGGER
+# ===================================================
+def stats_logger_thread():
+    """Background thread that logs stats every STATS_LOG_INTERVAL seconds"""
+    while True:
+        time.sleep(STATS_LOG_INTERVAL)
+        try:
+            virtual_balance.log_stats()
+        except Exception as e:
+            log(f"❌ Stats logging error: {e}", "ERROR")
 
 
 # ===================================================
@@ -236,6 +298,14 @@ def get_current_price(symbol):
 # ===================================================
 virtual_balance = VirtualBalance(INITIAL_BALANCE)
 load_state()
+
+# Start stats logger thread
+stats_thread = threading.Thread(target=stats_logger_thread, daemon=True)
+stats_thread.start()
+log("🚀 Stats logger started - will log every 5 minutes")
+
+# Log initial stats on startup
+virtual_balance.log_stats()
 
 # ===================================================
 # ✅ WEBHOOK ENDPOINT
@@ -264,31 +334,39 @@ def webhook():
 
     # Check secret
     if data.get('secret') != WEBHOOK_SECRET:
+        log("⚠️  Unauthorized webhook attempt", "WARN")
         return jsonify({'error': 'Unauthorized'}), 401
 
     # Debounce signals (prevent spam)
     now = time.time()
     if now - last_signal_time < DEBOUNCE_SEC:
+        log("⏱️  Signal debounced (too fast)")
         return jsonify({'success': True, 'action': 'debounced'}), 200
     last_signal_time = now
 
     # Stop trading if paused
     if not virtual_balance.should_trade():
+        log("⛔ Signal rejected - trading paused", "WARN")
         return jsonify({'success': False, 'reason': 'paused'}), 200
 
     # Get action
     action = data.get('action', '').upper()
     if action not in ['BUY', 'LONG', 'SELL', 'SHORT']:
+        log(f"❌ Invalid action received: {action}", "ERROR")
         return jsonify({'error': 'Invalid action'}), 400
+
+    log(f"📡 Webhook signal received: {action}")
 
     # Get live price
     price = get_current_price(SYMBOL)
     if not price:
+        log("❌ Failed to fetch current price", "ERROR")
         return jsonify({'error': 'Price fetch failed'}), 500
 
     # Open or flip position
     with virtual_balance.position_lock:
         if virtual_balance.current_position:
+            log(f"🔄 Flipping position from {virtual_balance.current_position['side'].upper()} to {action}")
             virtual_balance.close_position(price, 'signal_flip')
 
         qty = virtual_balance.current_balance * (RISK_PERCENTAGE / 100) * LEVERAGE / price
@@ -309,11 +387,19 @@ def webhook():
 # ===================================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "message": "bot running fine"}), 200
+    return jsonify({
+        "status": "ok", 
+        "message": "bot running fine",
+        "balance": virtual_balance.current_balance,
+        "trades": virtual_balance.total_trades,
+        "active_position": virtual_balance.current_position is not None
+    }), 200
 
 
 # ===================================================
 # ✅ MAIN ENTRY POINT
 # ===================================================
 if __name__ == "__main__":
+    log("🤖 Bitget Trading Bot Starting...")
+    log(f"📍 Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Risk: {RISK_PERCENTAGE}%")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
