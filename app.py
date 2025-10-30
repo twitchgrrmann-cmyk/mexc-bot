@@ -33,18 +33,18 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "Grrtrades")
 SYMBOL = os.environ.get("SYMBOL", "TAOUSDT_UMCBL")
 PRODUCT_TYPE = "umcbl"  # USDT-M futures
 MARGIN_COIN = "USDT"
-LEVERAGE = int(os.environ.get("LEVERAGE", 12))
+LEVERAGE = int(os.environ.get("LEVERAGE", 9))
 RISK_PERCENTAGE = float(os.environ.get("RISK_PERCENTAGE", 20.0))
-INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", 5.0))
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", 2.0))
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", 1.3))
-PHASE_1_THRESHOLD = float(os.environ.get("PHASE_1_THRESHOLD", 2000.0))
-PROFIT_RESET_THRESHOLD = 2.0  # 200%
+INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", 25.0))
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", 1.5))
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", 1))
+PHASE_1_THRESHOLD = float(os.environ.get("PHASE_1_THRESHOLD", 1500.0))
+PROFIT_RESET_THRESHOLD = 1.5  # 150%
 MAX_DRAWDOWN_STOP = float(os.environ.get("MAX_DRAWDOWN_STOP", 50.0))
 DEBOUNCE_SEC = float(os.environ.get("DEBOUNCE_SEC", 2.0))
 PRICE_CHECK_INTERVAL = 1.0
 MAX_PRICE_FAILURES = 5
-STATS_LOG_INTERVAL = 300  # Log stats every 5 minutes
+STATS_LOG_INTERVAL = 60  # Log stats every 5 minutes
 
 # ===================================================
 # ✅ LOGGING
