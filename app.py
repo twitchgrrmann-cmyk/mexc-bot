@@ -43,8 +43,8 @@ PROFIT_RESET_THRESHOLD = 1.5  # 150%
 MAX_DRAWDOWN_STOP = float(os.environ.get("MAX_DRAWDOWN_STOP", 50.0))
 DEBOUNCE_SEC = float(os.environ.get("DEBOUNCE_SEC", 2.0))
 PRICE_CHECK_INTERVAL = 1.0
-MAX_PRICE_FAILURES = 5
-STATS_LOG_INTERVAL = 60  # Log stats every 5 minutes
+MAX_PRICE_FAILURES = 10
+STATS_LOG_INTERVAL = 300  # Log stats every 5 minutes
 
 # ===================================================
 # ✅ LOGGING
