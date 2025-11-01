@@ -33,11 +33,11 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "Grrtrades")
 SYMBOL = os.environ.get("SYMBOL", "TAOUSDT_UMCBL")
 PRODUCT_TYPE = "umcbl"  # USDT-M futures
 MARGIN_COIN = "USDT"
-LEVERAGE = int(os.environ.get("LEVERAGE", 9))
+LEVERAGE = int(os.environ.get("LEVERAGE", 12))
 RISK_PERCENTAGE = float(os.environ.get("RISK_PERCENTAGE", 20.0))
 INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", 25.0))
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", 1.5))
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", 1))
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", 1.55))
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", 1.0))
 PHASE_1_THRESHOLD = float(os.environ.get("PHASE_1_THRESHOLD", 1500.0))
 PROFIT_RESET_THRESHOLD = 1.5  # 150%
 MAX_DRAWDOWN_STOP = float(os.environ.get("MAX_DRAWDOWN_STOP", 50.0))
@@ -572,6 +572,26 @@ def webhook():
 
     # Get action
     action = data.get('action', '').upper()
+    
+    # Handle CLOSE signal from TradingView
+    if action == 'CLOSE':
+        log("📥 TradingView CLOSE signal received")
+        if virtual_balance.current_position:
+            price = get_current_price(SYMBOL)
+            if not price:
+                log("❌ Failed to fetch price for close", "ERROR")
+                return jsonify({'error': 'Price fetch failed'}), 500
+            
+            virtual_balance.close_position(price, "TV_CLOSE")
+            return jsonify({
+                'success': True,
+                'action': 'closed',
+                'price': price
+            }), 200
+        else:
+            log("ℹ️  CLOSE signal but no position open (already closed by bot)")
+            return jsonify({'success': True, 'action': 'no_position'}), 200
+    
     if action not in ['BUY', 'LONG', 'SELL', 'SHORT']:
         log(f"❌ Invalid action received: {action}", "ERROR")
         return jsonify({'error': 'Invalid action'}), 400
